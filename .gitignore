@@ -1,0 +1,53 @@
+.DS_Store
+**/.DS_Store
+
+# Python bytecode and caches
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# ML outputs and large local artifacts
+checkpoints/
+logs/
+wandb/
+outputs/
+runs/
+artifacts/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.trt
+
+# Temporary files
+tmp/
+temp/
+*.log

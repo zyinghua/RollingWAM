@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin
+  - override /model: rollingwam
+  - _self_
+
+# dataloading
+batch_size: 16
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# rolling needs 1 + 4*chunk_latents*(W+H) VIDEO frames after the x4 action->video
+# subsampling: 129 raw steps -> 33 video frames -> 9 latents (W=4, H=4, chunk_latents=1).
+# Pad-free windows are required (padded frames may not enter the window/context).
+data:
+  train:
+    num_frames: 129
+    skip_padding_as_possible: true
+  val:
+    num_frames: 129
+    skip_padding_as_possible: true
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 500
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
