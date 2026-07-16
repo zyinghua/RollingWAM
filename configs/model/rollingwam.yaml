@@ -63,10 +63,10 @@ loss:
 # actions_per_chunk = action_horizon / (W+H) = 4*chunk_latents*action_video_freq_ratio.
 rolling:
   window_blocks: 4
-  num_context_chunks: 0  # 0 = latest-frame conditioning only (FastWAM-style); >0 adds GT history chunks
+  num_context_chunks: 0  # 0 = latest-frame conditioning only; >0 adds GT history chunks
   chunk_latents: 1
   actions_per_chunk: 16
-  num_inference_steps: 16
+  num_inference_steps: 12  # must be divisible by window_blocks;
   use_phase_offset: true
   partial_window_prob: 0.35
   partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0

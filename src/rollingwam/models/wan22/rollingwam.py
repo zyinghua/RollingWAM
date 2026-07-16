@@ -29,7 +29,7 @@ class RollingWAM(WAM):
         num_context_chunks: int = 0,
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
-        num_inference_steps: int = 16,
+        num_inference_steps: int = 12,
         use_phase_offset: bool = True,
         partial_window_prob: float = 0.0,
         partial_context_prob: float = 0.0,
