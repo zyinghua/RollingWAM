@@ -26,7 +26,7 @@ class RollingWAM(WAM):
     def configure_rolling(
         self,
         window_blocks: int = 4,
-        num_context_chunks: int = 2,
+        num_context_chunks: int = 0,
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
         num_inference_steps: int = 16,
@@ -149,8 +149,6 @@ class RollingWAM(WAM):
         H, W = self.num_context_chunks, self.window_blocks
         h, win = self._draw_regime() if self.training else (H, W)
 
-        # The conditioning state must be the WINDOW-START state (what deployment provides),
-        # not the sample-start state build_inputs would take: slice it before build_inputs.
         if sample.get("proprio", None) is not None and h > 0:
             proprio = sample["proprio"]
             aspc = self.actions_per_chunk

@@ -12,15 +12,12 @@ num_workers: 8
 model:
   mot_checkpoint_mixed_attn: false
 
-# rolling needs 1 + 4*chunk_latents*(W+H) VIDEO frames after the x4 action->video
-# subsampling: 129 raw steps -> 33 video frames -> 9 latents (W=4, H=4, chunk_latents=1).
-# Pad-free windows are required (padded frames may not enter the window/context).
 data:
   train:
-    num_frames: 129
+    num_frames: 65
     skip_padding_as_possible: true
   val:
-    num_frames: 129
+    num_frames: 65
     skip_padding_as_possible: true
 
 # scheduler
