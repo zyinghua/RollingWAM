@@ -66,6 +66,7 @@ rolling:
   num_context_chunks: 0  # 0 = latest-frame conditioning only; >0 adds GT history chunks
   chunk_latents: 1
   actions_per_chunk: 16
+  video_attends_actions: true
   num_inference_steps: 12  # must be divisible by window_blocks;
   use_phase_offset: true
   partial_window_prob: 0.35

@@ -29,6 +29,7 @@ class RollingWAM(WAM):
         num_context_chunks: int = 0,
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
+        video_attends_actions: bool = True,
         num_inference_steps: int = 12,
         use_phase_offset: bool = True,
         partial_window_prob: float = 0.0,
@@ -51,6 +52,7 @@ class RollingWAM(WAM):
         self.num_context_chunks = int(num_context_chunks)
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
+        self.video_attends_actions = bool(video_attends_actions)
         self.num_inference_steps = int(num_inference_steps)
         self.use_phase_offset = bool(use_phase_offset)
         self.partial_window_prob = float(partial_window_prob)
@@ -123,11 +125,15 @@ class RollingWAM(WAM):
         mask[:tokens_per_frame, :video_seq_len] = False
         mask[:tokens_per_frame, :tokens_per_frame] = True                # anchor self-attends only
 
-        # action chunk i -> all video + own action chunk; video never attends actions.
+        # action chunk i -> all video + own action chunk
         action_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)
         a = slice(video_seq_len, total)
         mask[a, v] = True
         mask[a, a] = action_chunk.view(-1, 1) == action_chunk.view(1, -1)
+
+        # video window chunk i -> its own action chunk
+        if self.video_attends_actions:
+            mask[v, a] = token_chunk.view(-1, 1) == (ctx_chunks + action_chunk.view(1, -1))
         return mask
 
     # ------------------------------------------------------------------ training
