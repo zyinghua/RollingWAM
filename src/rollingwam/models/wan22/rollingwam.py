@@ -35,6 +35,17 @@ class RollingWAM(WAM):
         partial_window_prob: float = 0.0,
         partial_context_prob: float = 0.0,
     ):
+        for a, b in (
+            (self.train_video_scheduler, self.train_action_scheduler),
+            (self.infer_video_scheduler, self.infer_action_scheduler),
+        ):
+            if a.shift != b.shift or a.num_train_timesteps != b.num_train_timesteps:
+                raise ValueError(
+                    "RollingWAM requires identical video/action schedulers (shift, "
+                    f"num_train_timesteps); got video=({a.shift}, {a.num_train_timesteps}) "
+                    f"vs action=({b.shift}, {b.num_train_timesteps})."
+                )
+
         if window_blocks < 1:
             raise ValueError(f"`window_blocks` must be >= 1, got {window_blocks}")
         if num_context_chunks < 0:

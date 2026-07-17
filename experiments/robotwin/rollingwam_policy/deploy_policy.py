@@ -2,7 +2,6 @@ import logging
 import os
 import sys
 import time
-import inspect
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -55,11 +54,6 @@ def _parse_optional_int(value: Any) -> Optional[int]:
         return None
     return int(value)
 
-
-def _parse_optional_float(value: Any) -> Optional[float]:
-    if _is_none_like(value):
-        return None
-    return float(value)
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -144,17 +138,10 @@ class WorldActionRobotWinPolicy:
         dataset_stats_path: Path,
         device: str,
         model_dtype: torch.dtype,
-        action_horizon: int,
-        replan_steps: int,
-        num_inference_steps: int,
-        sigma_shift: Optional[float],
         seed: Optional[int],
         text_cfg_scale: float,
         negative_prompt: str,
-        rand_device: str,
-        tiled: bool,
         timing_enabled: bool,
-        num_video_frames: int,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -167,17 +154,10 @@ class WorldActionRobotWinPolicy:
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
         self.processor.set_normalizer_from_stats(dataset_stats)
 
-        self.action_horizon = int(action_horizon)
-        self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
-        self.num_inference_steps = int(num_inference_steps)
-        self.sigma_shift = sigma_shift
         self.seed = seed
         self.text_cfg_scale = float(text_cfg_scale)
         self.negative_prompt = str(negative_prompt)
-        self.rand_device = str(rand_device)
-        self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
-        self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
         # one chunk of raw sim steps; the model sees the video-rate subsample
@@ -189,11 +169,11 @@ class WorldActionRobotWinPolicy:
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | chunk=%d actions | S=%d",
             checkpoint_path,
             dataset_stats_path,
-            self.action_horizon,
-            self.replan_steps,
+            self.model.actions_per_chunk,
+            self.model.num_inference_steps,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -355,30 +335,12 @@ def get_model(usr_args: Dict[str, Any]):
         dataset_stats_path=usr_args.get("dataset_stats_path"),
     )
 
-    action_horizon = _parse_optional_int(usr_args.get("action_horizon"))
-    if action_horizon is None:
-        eval_horizon = _parse_optional_int(cfg.EVALUATION.get("action_horizon"))
-        action_horizon = eval_horizon if eval_horizon is not None else int(cfg.data.train.num_frames) - 1
-    if action_horizon <= 0:
-        raise ValueError(f"`action_horizon` must be positive, got {action_horizon}")
-
-    replan_steps = _parse_optional_int(usr_args.get("replan_steps"))
-    if replan_steps is None:
-        replan_steps = int(cfg.EVALUATION.get("replan_steps", 8))
-
-    num_inference_steps = _parse_optional_int(usr_args.get("num_inference_steps"))
-    if num_inference_steps is None:
-        num_inference_steps = int(cfg.EVALUATION.get("num_inference_steps", cfg.eval_num_inference_steps))
-
-    sigma_shift = _parse_optional_float(usr_args.get("sigma_shift"))
-    if sigma_shift is None:
-        sigma_shift = _parse_optional_float(cfg.EVALUATION.get("sigma_shift"))
-
+    # rolling executes exactly one chunk (model.actions_per_chunk) per replan and its
+    # schedule (S, shift) is fixed at training — no replan_steps/num_inference_steps/
+    # sigma_shift deploy knobs.
     seed = _parse_optional_int(usr_args.get("seed"))
     text_cfg_scale = float(usr_args.get("text_cfg_scale", cfg.EVALUATION.get("text_cfg_scale", 1.0)))
     negative_prompt = str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", "")))
-    rand_device = str(usr_args.get("rand_device", cfg.EVALUATION.get("rand_device", "cpu")))
-    tiled = _parse_bool(usr_args.get("tiled", cfg.EVALUATION.get("tiled", False)))
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
@@ -390,17 +352,10 @@ def get_model(usr_args: Dict[str, Any]):
         dataset_stats_path=dataset_stats_path,
         device=device,
         model_dtype=model_dtype,
-        action_horizon=action_horizon,
-        replan_steps=replan_steps,
-        num_inference_steps=num_inference_steps,
-        sigma_shift=sigma_shift,
         seed=seed,
         text_cfg_scale=text_cfg_scale,
         negative_prompt=negative_prompt,
-        rand_device=rand_device,
-        tiled=tiled,
         timing_enabled=timing_enabled,
-        num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
     )
     return policy
 

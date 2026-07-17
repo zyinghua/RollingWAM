@@ -24,8 +24,6 @@ Examples:
      ckpt=/path/to/ckpt.pt \
      EVALUATION.task_name=click_alarmclock \
      EVALUATION.task_config=demo_randomized \
-     EVALUATION.replan_steps=4 \
-     EVALUATION.num_inference_steps=4 \
      gpu_id=0
 """
 
@@ -212,14 +210,8 @@ def main(cfg: DictConfig):
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
     _append_override(overrides, "dataset_stats_path", str(dataset_stats_path))
-    _append_override(overrides, "action_horizon", cfg.EVALUATION.action_horizon)
-    _append_override(overrides, "replan_steps", cfg.EVALUATION.replan_steps)
-    _append_override(overrides, "num_inference_steps", cfg.EVALUATION.num_inference_steps)
-    _append_override(overrides, "sigma_shift", cfg.EVALUATION.sigma_shift)
     _append_override(overrides, "text_cfg_scale", cfg.EVALUATION.text_cfg_scale)
     _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
-    _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
-    _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
     _append_override(
         overrides,
