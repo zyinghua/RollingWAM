@@ -31,7 +31,6 @@ class RollingWAM(WAM):
         actions_per_chunk: int = 16,
         video_attends_actions: bool = True,
         num_inference_steps: int = 12,
-        use_phase_offset: bool = True,
         partial_window_prob: float = 0.0,
         partial_context_prob: float = 0.0,
     ):
@@ -73,7 +72,6 @@ class RollingWAM(WAM):
         self.actions_per_chunk = int(actions_per_chunk)
         self.video_attends_actions = bool(video_attends_actions)
         self.num_inference_steps = int(num_inference_steps)
-        self.use_phase_offset = bool(use_phase_offset)
         self.partial_window_prob = float(partial_window_prob)
         self.partial_context_prob = float(partial_context_prob)
         self.rolling_reset()
@@ -227,7 +225,7 @@ class RollingWAM(WAM):
         ladder_t, _ = self._rolling_ladder(device, torch.float32)
 
         sub = self.num_inference_steps // W
-        if self.training and sub > 1 and (self.use_phase_offset or win < W):
+        if self.training and sub > 1:
             phase = torch.randint(0, sub, (batch_size,), device=device)
         else:
             phase = torch.zeros((batch_size,), dtype=torch.long, device=device)
