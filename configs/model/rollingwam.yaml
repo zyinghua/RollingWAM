@@ -67,6 +67,7 @@ rolling:
   chunk_latents: 1
   actions_per_chunk: 16
   video_attends_actions: false
+  context_routing: split # split: video -> video, action->action, shared: video/action -> video
   num_inference_steps: 12  # must be divisible by window_blocks;
   partial_window_prob: 0.2
   partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0

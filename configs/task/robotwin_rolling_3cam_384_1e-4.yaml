@@ -14,7 +14,7 @@ model:
 
 data:
   train:
-    num_frames: 65
+    num_frames: 65  # = 4*(1 + 4*chunk_latents*(W+H) - 1) + 1; must track model.rolling W/H
     skip_padding_as_possible: true
   val:
     num_frames: 65
