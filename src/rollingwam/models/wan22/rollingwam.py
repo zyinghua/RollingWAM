@@ -59,6 +59,14 @@ class RollingWAM(WAM):
                 f"`num_inference_steps` ({num_inference_steps}) must be divisible "
                 f"by `window_blocks` ({window_blocks})"
             )
+        if num_context_chunks > 0 and partial_context_prob <= 0:
+            logger.warning(
+                "num_context_chunks=%d with partial_context_prob=0: inference will visit "
+                "context sizes h=1..%d while the cache fills, but training never shows them. "
+                "Set rolling.partial_context_prob > 0.",
+                num_context_chunks, num_context_chunks - 1,
+            )
+
         self.window_blocks = int(window_blocks)
         self.num_context_chunks = int(num_context_chunks)
         self.chunk_latents = int(chunk_latents)
