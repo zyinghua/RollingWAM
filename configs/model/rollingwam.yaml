@@ -69,5 +69,5 @@ rolling:
   video_attends_actions: true
   num_inference_steps: 12  # must be divisible by window_blocks;
   use_phase_offset: true
-  partial_window_prob: 0.35
+  partial_window_prob: 0.2
   partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0
