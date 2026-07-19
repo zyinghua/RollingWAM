@@ -1,3 +1,0 @@
-[submodule "third-party/RoboTwin"]
-	path = third-party/RoboTwin
-	url = https://github.com/RoboTwin-Platform/RoboTwin.git
