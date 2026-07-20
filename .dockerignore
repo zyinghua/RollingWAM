@@ -1,0 +1,11 @@
+.git/
+data/
+datasets/
+checkpoints/
+runs/
+evaluate_results/
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+*.egg-info/
