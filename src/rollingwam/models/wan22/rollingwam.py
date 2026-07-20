@@ -101,6 +101,56 @@ class RollingWAM(WAM):
         model = super().from_wan22_pretrained(**kwargs)
         return model.configure_rolling(**(rolling or {}))
 
+    ROLLING_KEYS = (
+        "window_blocks", "num_context_chunks", "chunk_latents", "actions_per_chunk",
+        "video_attends_actions", "context_routing", "num_inference_steps",
+        "partial_window_prob", "partial_context_prob",
+    )
+
+    def get_rolling_config(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in self.ROLLING_KEYS}
+
+    def save_checkpoint(self, path, optimizer=None, step=None):
+        payload = {
+            "mot": self.mot.state_dict(),
+            "step": step,
+            "torch_dtype": str(self.torch_dtype),
+            "rolling": self.get_rolling_config(),
+        }
+        if self.proprio_encoder is not None:
+            payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if optimizer is not None:
+            payload["optimizer"] = optimizer.state_dict()
+        torch.save(payload, path)
+
+    def load_checkpoint(self, path, optimizer=None):
+        payload = super().load_checkpoint(path, optimizer=optimizer)
+        saved = payload.get("rolling")
+        if saved is None:
+            logger.warning(
+                "Checkpoint has no rolling config (legacy/base checkpoint); keeping the "
+                "current yaml rolling settings — verify they match how it was trained."
+            )
+            return payload
+
+        expected_keys = set(self.ROLLING_KEYS)
+        if not isinstance(saved, dict) or set(saved) != expected_keys:
+            got = sorted(saved) if isinstance(saved, dict) else type(saved).__name__
+            raise ValueError(
+                "Checkpoint rolling config keys do not match: "
+                f"expected={sorted(expected_keys)}, got={got}."
+            )
+        current = self.get_rolling_config()
+        diff = {
+            key: (current[key], saved[key])
+            for key in self.ROLLING_KEYS
+            if current[key] != saved[key]
+        }
+        if diff:
+            logger.warning("Applying checkpoint rolling config over yaml: %s", diff)
+        self.configure_rolling(**saved)
+        return payload
+
     # ------------------------------------------------------------------ ladder
 
     def _rolling_ladder(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
@@ -235,23 +285,12 @@ class RollingWAM(WAM):
                 f"streaming inference relies on this being fixed."
             )
 
-        if image_is_pad is not None and bool(image_is_pad.any()):
-            raise ValueError(
-                "RollingWAM training requires pad-free windows: padded frames would enter the "
-                "bidirectional window / clean context. Enable data skip_padding_as_possible."
-            )
-
         latents = input_latents[:, :, : 1 + (h + win) * nfpb]
         window_action = action[:, h * aspc : (h + win) * aspc]
         window_action_is_pad = None if action_is_pad is None else action_is_pad[:, h * aspc : (h + win) * aspc]
 
         ha = h if self.context_routing == "split" else 0
         context_action = action[:, :ha * aspc] if ha > 0 else None
-        if ha > 0 and action_is_pad is not None and bool(action_is_pad[:, :ha * aspc].any()):
-            raise ValueError(
-                "Executed-action context contains padded steps; conditioning would be corrupt. "
-                "Enable data skip_padding_as_possible."
-            )
 
         device, dtype = latents.device, latents.dtype
         n_steps = float(self.train_video_scheduler.num_train_timesteps)
@@ -341,6 +380,7 @@ class RollingWAM(WAM):
             window_valid = (~latent_is_pad[:, h * nfpb : (h + win) * nfpb]).to(video_loss_frame.dtype)
         else:
             window_valid = torch.ones_like(video_loss_frame)
+        video_weight = video_weight.clamp(min=0.05)
         valid_sum = window_valid.sum(dim=1).clamp(min=1.0)
         loss_video = ((video_loss_frame * video_weight * window_valid).sum(dim=1) / valid_sum).mean()
 
@@ -351,6 +391,7 @@ class RollingWAM(WAM):
         action_weight = self.train_action_scheduler.training_weight(
             t_window_action.reshape(-1)
         ).reshape(batch_size, -1).to(action_loss_token.device, dtype=action_loss_token.dtype)
+        action_weight = action_weight.clamp(min=0.05)
         if window_action_is_pad is not None:
             action_valid = (~window_action_is_pad).to(action_loss_token.dtype)
         else:

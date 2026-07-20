@@ -577,6 +577,9 @@ class Wan22Trainer:
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
+        model = self.accelerator.unwrap_model(self.model)
+        if hasattr(model, "get_rolling_config"):
+            payload["rolling"] = model.get_rolling_config()
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -599,11 +602,28 @@ class Wan22Trainer:
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        payload = None
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+
+            model = self.accelerator.unwrap_model(self.model)
+            if hasattr(model, "get_rolling_config"):
+                saved_rolling = payload.get("rolling")
+                if saved_rolling is None:
+                    logger.warning(
+                        "State file `%s` has no rolling config; compatibility cannot be checked.",
+                        state_file,
+                    )
+                elif saved_rolling != model.get_rolling_config():
+                    raise ValueError(
+                        "RollingWAM config mismatch for full training resume: "
+                        f"checkpoint={saved_rolling}, current={model.get_rolling_config()}"
+                    )
+
+        self.accelerator.load_state(input_dir=state_dir)
+        if payload is not None:
             self.global_step = int(payload["global_step"])
 
             if "epoch" in payload and "batch_in_epoch" in payload:
