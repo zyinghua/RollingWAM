@@ -58,13 +58,16 @@ loss:
   lambda_action: 1.0
 
 rolling:
-  window_blocks: 4
+  window_blocks: 5
   num_context_chunks: 0  # 0 = latest-frame conditioning only; >0 adds GT history chunks
   chunk_latents: 1
-  actions_per_chunk: 16
+  # derived: 4 (VAE temporal factor) * chunk_latents * actions per video frame
+  actions_per_chunk: ${eval:'4 * ${model.rolling.chunk_latents} * ${data.train.action_video_freq_ratio}'}
   video_attends_actions: false
-  context_routing: split # split: video -> video, action->action, shared: video/action -> video
-  num_inference_steps: 12  # must be divisible by window_blocks;
+  # history routing, only active when num_context_chunks > 0. split: window actions read
+  # executed-action history, video reads video history; shared: both read video history
+  context_routing: split
+  num_inference_steps: 10  # must be divisible by window_blocks;
   partial_window_prob: 0.2
   partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0
   obs_offset_prob: 0.0  # chance to noise the window from a time-shifted clip (supervision stays GT); 0 disables the augmentation entirely (range and data margin auto-zeroed)
