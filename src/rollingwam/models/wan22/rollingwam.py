@@ -30,8 +30,7 @@ class RollingWAM(WAM):
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
         video_attends_actions: bool = True,
-        context_routing: str = "split",
-        num_inference_steps: int = 12,
+        history_context_routing: str = "split",
         partial_window_prob: float = 0.0,
         partial_context_prob: float = 0.0,
         obs_offset_prob: float = 0.0,
@@ -40,12 +39,13 @@ class RollingWAM(WAM):
         for a, b in (
             (self.train_video_scheduler, self.train_action_scheduler),
             (self.infer_video_scheduler, self.infer_action_scheduler),
+            (self.train_video_scheduler, self.infer_video_scheduler),
         ):
             if a.shift != b.shift or a.num_train_timesteps != b.num_train_timesteps:
                 raise ValueError(
-                    "RollingWAM requires identical video/action schedulers (shift, "
-                    f"num_train_timesteps); got video=({a.shift}, {a.num_train_timesteps}) "
-                    f"vs action=({b.shift}, {b.num_train_timesteps})."
+                    "RollingWAM requires identical schedulers across video/action and "
+                    f"train/infer (shift, num_train_timesteps); got ({a.shift}, "
+                    f"{a.num_train_timesteps}) vs ({b.shift}, {b.num_train_timesteps})."
                 )
 
         if window_blocks < 1:
@@ -56,18 +56,13 @@ class RollingWAM(WAM):
             raise ValueError(f"`chunk_latents` must be >= 1, got {chunk_latents}")
         if actions_per_chunk < 1:
             raise ValueError(f"`actions_per_chunk` must be >= 1, got {actions_per_chunk}")
-        if num_inference_steps % window_blocks != 0:
-            raise ValueError(
-                f"`num_inference_steps` ({num_inference_steps}) must be divisible "
-                f"by `window_blocks` ({window_blocks})"
-            )
         if partial_window_prob + partial_context_prob > 1.0:
             raise ValueError(
                 f"partial_window_prob + partial_context_prob must be <= 1, got "
                 f"{partial_window_prob} + {partial_context_prob}"
             )
-        if context_routing not in ("split", "shared"):
-            raise ValueError(f"`context_routing` must be 'split' or 'shared', got {context_routing!r}")
+        if history_context_routing not in ("split", "shared"):
+            raise ValueError(f"`history_context_routing` must be 'split' or 'shared', got {history_context_routing!r}")
         if not 0.0 <= obs_offset_prob <= 1.0:
             raise ValueError(f"`obs_offset_prob` must be in [0, 1], got {obs_offset_prob}")
         if obs_offset_range < 0:
@@ -87,8 +82,7 @@ class RollingWAM(WAM):
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
         self.video_attends_actions = bool(video_attends_actions)
-        self.context_routing = str(context_routing)
-        self.num_inference_steps = int(num_inference_steps)
+        self.history_context_routing = str(history_context_routing)
         self.partial_window_prob = float(partial_window_prob)
         self.partial_context_prob = float(partial_context_prob)
         self.obs_offset_prob = float(obs_offset_prob)
@@ -113,7 +107,7 @@ class RollingWAM(WAM):
 
     ROLLING_KEYS = (
         "window_blocks", "num_context_chunks", "chunk_latents", "actions_per_chunk",
-        "video_attends_actions", "context_routing", "num_inference_steps",
+        "video_attends_actions", "history_context_routing",
         "partial_window_prob", "partial_context_prob", "obs_offset_prob", "obs_offset_range",
     )
 
@@ -126,6 +120,10 @@ class RollingWAM(WAM):
             "step": step,
             "torch_dtype": str(self.torch_dtype),
             "rolling": self.get_rolling_config(),
+            "scheduler": {
+                "shift": self.train_video_scheduler.shift,
+                "num_train_timesteps": self.train_video_scheduler.num_train_timesteps,
+            },
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -135,6 +133,18 @@ class RollingWAM(WAM):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = super().load_checkpoint(path, optimizer=optimizer)
+
+        saved_sched = payload.get("scheduler")
+        if saved_sched is not None:
+            cur = self.train_video_scheduler
+            if (saved_sched.get("shift") != cur.shift
+                    or saved_sched.get("num_train_timesteps") != cur.num_train_timesteps):
+                raise ValueError(
+                    f"Scheduler mismatch: checkpoint trained with {saved_sched}, yaml has "
+                    f"shift={cur.shift}, num_train_timesteps={cur.num_train_timesteps}. "
+                    "The rolling schedule is defined by the shift; fix the scheduler yaml."
+                )
+
         saved = payload.get("rolling")
         if saved is None:
             logger.warning(
@@ -170,21 +180,16 @@ class RollingWAM(WAM):
 
     # ------------------------------------------------------------------ ladder
 
-    def _rolling_ladder(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rolling_ladder(
+        self, num_inference_steps: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """S-rung schedule from the video inference scheduler.
         Returns (timesteps [S], deltas [S]); rung 0 = noisiest, rung S-1 = cleanest."""
         return self.infer_video_scheduler.build_inference_schedule(
-            num_inference_steps=self.num_inference_steps,
+            num_inference_steps=num_inference_steps,
             device=device,
             dtype=dtype,
         )
-
-    def _window_rungs(self, win: int, phase: torch.Tensor) -> torch.Tensor:
-        """Rung index per window block, front cleanest.
-        phase: [B] in [0, sub). Returns [B, win]; block j gets (win-1-j)*sub + phase."""
-        sub = self.num_inference_steps // self.window_blocks
-        j = torch.arange(win, device=phase.device).view(1, win)
-        return (win - 1 - j) * sub + phase.view(-1, 1)
 
     # ------------------------------------------------------------------ mask
 
@@ -393,20 +398,22 @@ class RollingWAM(WAM):
         window_action = action[:, h * aspc : (h + win) * aspc]
         window_action_is_pad = None if action_is_pad is None else action_is_pad[:, h * aspc : (h + win) * aspc]
 
-        ha = h if self.context_routing == "split" else 0
+        ha = h if self.history_context_routing == "split" else 0
         context_action = action[:, :ha * aspc] if ha > 0 else None
 
         device, dtype = latents.device, latents.dtype
         n_steps = float(self.train_video_scheduler.num_train_timesteps)
-        ladder_t, _ = self._rolling_ladder(device, torch.float32)
 
-        sub = self.num_inference_steps // W
-        if self.dit.training and sub > 1:
-            phase = torch.randint(0, sub, (batch_size,), device=device)
+        # Rolling Diffusion local time: u = (slot + t) / W with global t ~ U(0,1);
+        # partial windows occupy the back slots
+        if self.dit.training:
+            t_global = torch.rand((batch_size, 1), device=device)
         else:
-            phase = torch.zeros((batch_size,), dtype=torch.long, device=device)
-        rungs = self._window_rungs(win, phase)                                   # [B, win]
-        t_window_chunk = ladder_t[rungs]                                         # [B, win]
+            t_global = torch.ones((batch_size, 1), device=device)
+        slots = torch.arange(W - win, W, device=device, dtype=torch.float32).view(1, win)
+        sch = self.train_video_scheduler
+        sigma_chunk = sch._phi((slots + t_global) / W, sch.shift)
+        t_window_chunk = sigma_chunk * n_steps                                   # [B, win]
 
         timestep_video = torch.zeros((batch_size, latents.shape[2]), dtype=torch.float32, device=device)
         t_window_frame = t_window_chunk.repeat_interleave(nfpb, dim=1)           # [B, win*nfpb]
@@ -529,6 +536,7 @@ class RollingWAM(WAM):
         self._rungs: list[int] = []
         self._raw_frames: Optional[torch.Tensor] = None       # [1, 3, N, H, W] in [-1, 1]
         self._executed_actions: list[torch.Tensor] = []        # emitted chunks, newest last
+        self._stream_steps: Optional[int] = None               # S locked for the episode
         self._push_count: int = 0
         self._cached_context: Optional[tuple] = None
         self._cached_negative: Optional[tuple] = None
@@ -589,7 +597,7 @@ class RollingWAM(WAM):
         win = len(self._rungs)
         h = (ctx_latents.shape[2] - 1) // nfpb
 
-        if self.context_routing == "split" and self._executed_actions:
+        if self.history_context_routing == "split" and self._executed_actions:
             ctx_actions = torch.cat(self._executed_actions, dim=1)
             ha = ctx_actions.shape[1] // aspc
         else:
@@ -677,6 +685,7 @@ class RollingWAM(WAM):
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         seed: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
     ) -> dict[str, Any]:
         """One control step: feed newly observed frames, get the next action chunk.
 
@@ -690,7 +699,16 @@ class RollingWAM(WAM):
             raise ValueError(f"`new_frames` must be [1, 3, T, H, W], got {tuple(new_frames.shape)}")
 
         nfpb = self.chunk_latents
-        H, W, S = self.num_context_chunks, self.window_blocks, self.num_inference_steps
+        H, W = self.num_context_chunks, self.window_blocks
+        if num_inference_steps is None:
+            raise ValueError("`num_inference_steps` is required (inference-only knob, not model config)")
+        S = int(num_inference_steps)
+        if S % W != 0:
+            raise ValueError(f"num_inference_steps ({S}) must be divisible by window_blocks ({W})")
+        if self._stream_steps is None:
+            self._stream_steps = S
+        elif S != self._stream_steps:
+            raise ValueError(f"num_inference_steps changed mid-stream: {self._stream_steps} -> {S}")
         sub = S // W
         tdf = int(self.vae.temporal_downsample_factor)
         first_call = self._raw_frames is None
@@ -741,7 +759,7 @@ class RollingWAM(WAM):
         ctx_latents = self._encode_context_latents()
         z, latent_h, latent_w = ctx_latents.shape[1], ctx_latents.shape[3], ctx_latents.shape[4]
         aspc = self.actions_per_chunk
-        ladder_t, ladder_delta = self._rolling_ladder(self.device, torch.float32)
+        ladder_t, ladder_delta = self._rolling_ladder(S, self.device, torch.float32)
 
         if first_call:
             for _ in range(W):
@@ -789,7 +807,7 @@ class RollingWAM(WAM):
     ) -> dict[str, Any]:
         """Open-loop rollout for evaluation: rolling generation from one image, feeding the
         model's own emitted chunks back as context (no ground-truth camera available)."""
-        del action, num_inference_steps, sigma_shift, rand_device, tiled
+        del action, sigma_shift, rand_device, tiled
         self.eval()
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -822,6 +840,7 @@ class RollingWAM(WAM):
                 negative_prompt=negative_prompt,
                 text_cfg_scale=text_cfg_scale,
                 seed=seed,
+                num_inference_steps=num_inference_steps,
             )
             emitted_action.append(out["action"])
             emitted_video.append(out["video"])

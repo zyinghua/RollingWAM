@@ -210,6 +210,7 @@ def main(cfg: DictConfig):
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
     _append_override(overrides, "dataset_stats_path", str(dataset_stats_path))
+    _append_override(overrides, "num_inference_steps", cfg.EVALUATION.num_inference_steps)
     _append_override(overrides, "text_cfg_scale", cfg.EVALUATION.text_cfg_scale)
     _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)

@@ -44,6 +44,7 @@ action_dit_config:
   eps: 1.0e-06
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
+# linear: sigma_shift = 1.0
 video_scheduler:
   train_shift: 5.0
   infer_shift: 5.0
@@ -66,8 +67,7 @@ rolling:
   video_attends_actions: false
   # history routing, only active when num_context_chunks > 0. split: window actions read
   # executed-action history, video reads video history; shared: both read video history
-  context_routing: split
-  num_inference_steps: 10  # must be divisible by window_blocks;
+  history_context_routing: split
   partial_window_prob: 0.2
   partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0
   obs_offset_prob: 0.0  # chance to noise the window from a time-shifted clip (supervision stays GT); 0 disables the augmentation entirely (range and data margin auto-zeroed)

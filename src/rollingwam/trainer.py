@@ -593,6 +593,10 @@ class Wan22Trainer:
         model = self.accelerator.unwrap_model(self.model)
         if hasattr(model, "get_rolling_config"):
             payload["rolling"] = model.get_rolling_config()
+            payload["scheduler"] = {
+                "shift": model.train_video_scheduler.shift,
+                "num_train_timesteps": model.train_video_scheduler.num_train_timesteps,
+            }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -623,6 +627,15 @@ class Wan22Trainer:
 
             model = self.accelerator.unwrap_model(self.model)
             if hasattr(model, "get_rolling_config"):
+                saved_sched = payload.get("scheduler")
+                if saved_sched is not None:
+                    sch = model.train_video_scheduler
+                    if (saved_sched.get("shift") != sch.shift
+                            or saved_sched.get("num_train_timesteps") != sch.num_train_timesteps):
+                        raise ValueError(
+                            f"Scheduler mismatch for full training resume: state={saved_sched}, "
+                            f"current shift={sch.shift}, num_train_timesteps={sch.num_train_timesteps}."
+                        )
                 saved_rolling = payload.get("rolling")
                 if saved_rolling is None:
                     logger.warning(

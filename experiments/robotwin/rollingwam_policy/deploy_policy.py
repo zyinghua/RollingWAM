@@ -139,6 +139,7 @@ class WorldActionRobotWinPolicy:
         device: str,
         model_dtype: torch.dtype,
         seed: Optional[int],
+        num_inference_steps: int,
         text_cfg_scale: float,
         negative_prompt: str,
         timing_enabled: bool,
@@ -155,6 +156,7 @@ class WorldActionRobotWinPolicy:
         self.processor.set_normalizer_from_stats(dataset_stats)
 
         self.seed = seed
+        self.num_inference_steps = int(num_inference_steps)
         self.text_cfg_scale = float(text_cfg_scale)
         self.negative_prompt = str(negative_prompt)
         self.timing_enabled = bool(timing_enabled)
@@ -173,7 +175,7 @@ class WorldActionRobotWinPolicy:
             checkpoint_path,
             dataset_stats_path,
             self.model.actions_per_chunk,
-            self.model.num_inference_steps,
+            self.num_inference_steps,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -245,6 +247,7 @@ class WorldActionRobotWinPolicy:
                 negative_prompt=self.negative_prompt,
                 text_cfg_scale=self.text_cfg_scale,
                 seed=self.seed,
+                num_inference_steps=self.num_inference_steps,
             )
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
@@ -335,10 +338,10 @@ def get_model(usr_args: Dict[str, Any]):
         dataset_stats_path=usr_args.get("dataset_stats_path"),
     )
 
-    # rolling executes exactly one chunk (model.actions_per_chunk) per replan and its
-    # schedule (S, shift) is fixed at training — no replan_steps/num_inference_steps/
-    # sigma_shift deploy knobs.
     seed = _parse_optional_int(usr_args.get("seed"))
+    num_inference_steps = int(
+        usr_args.get("num_inference_steps", cfg.EVALUATION.get("num_inference_steps", 10))
+    )
     text_cfg_scale = float(usr_args.get("text_cfg_scale", cfg.EVALUATION.get("text_cfg_scale", 1.0)))
     negative_prompt = str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", "")))
     timing_enabled = _parse_bool(
@@ -353,6 +356,7 @@ def get_model(usr_args: Dict[str, Any]):
         device=device,
         model_dtype=model_dtype,
         seed=seed,
+        num_inference_steps=num_inference_steps,
         text_cfg_scale=text_cfg_scale,
         negative_prompt=negative_prompt,
         timing_enabled=timing_enabled,
