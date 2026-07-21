@@ -57,10 +57,6 @@ action_scheduler:
 loss:
   lambda_action: 1.0
 
-# Rolling window: W chunks denoised jointly under a diagonal ramp, conditioned on
-# [1-frame anchor | H clean context chunks]. Data must deliver 1 + 4*chunk_latents*(W+H)
-# VIDEO frames to the model (raw num_frames = that * action_video_freq_ratio, see task yaml).
-# actions_per_chunk = action_horizon / (W+H) = 4*chunk_latents*action_video_freq_ratio.
 rolling:
   window_blocks: 4
   num_context_chunks: 0  # 0 = latest-frame conditioning only; >0 adds GT history chunks
@@ -71,3 +67,5 @@ rolling:
   num_inference_steps: 12  # must be divisible by window_blocks;
   partial_window_prob: 0.2
   partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0
+  obs_offset_prob: 0.0  # chance to noise the window from a time-shifted clip (supervision stays GT); 0 disables the augmentation entirely (range and data margin auto-zeroed)
+  obs_offset_range: 4  # max |offset| in video frames (1 video frame = action_video_freq_ratio raw steps)

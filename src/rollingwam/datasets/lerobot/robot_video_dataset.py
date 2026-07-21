@@ -40,27 +40,31 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
+        obs_offset_margin: int = 0,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
+        assert obs_offset_margin >= 0, f"obs_offset_margin must be >= 0, got {obs_offset_margin}"
+        fetch_frames = num_frames + 2 * obs_offset_margin * action_video_freq_ratio
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
-            obs_size=num_frames,
-            action_size=num_frames - 1,
+            obs_size=fetch_frames,
+            action_size=fetch_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
-    
+
         self.num_frames = num_frames
+        self.obs_offset_margin = obs_offset_margin
         self.action_video_freq_ratio = action_video_freq_ratio
-        
+
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+        self.video_sample_indices = list(range(0, fetch_frames, self.action_video_freq_ratio))
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -85,6 +89,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if processor is not None:
             if isinstance(processor, DictConfig):
                 processor = instantiate(processor)
+            processor.num_obs_steps = fetch_frames  # samples carry the margin-extended clip
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -124,6 +129,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             action_is_pad = sample["action_is_pad"]
             image_is_pad = sample["image_is_pad"]
             proprio_is_pad = sample["proprio_is_pad"]
+            if self.obs_offset_margin > 0:
+                # margin pads are tolerated: the loss masks them (and offsets avoid them)
+                pm = self.obs_offset_margin * self.action_video_freq_ratio
+                action_is_pad = action_is_pad[pm:-pm]
+                image_is_pad = image_is_pad[pm:-pm]
+                proprio_is_pad = proprio_is_pad[pm:-pm]
             has_pad = False
             if bool(action_is_pad.any().item()):
                 has_pad = True

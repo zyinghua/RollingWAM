@@ -15,9 +15,11 @@ model:
 data:
   train:
     num_frames: 65  # = 4*(1 + 4*chunk_latents*(W+H) - 1) + 1; must track model.rolling W/H
+    obs_offset_margin: ${eval:'${model.rolling.obs_offset_range} if ${model.rolling.obs_offset_prob} > 0 else 0'}
     skip_padding_as_possible: true
   val:
     num_frames: 65
+    obs_offset_margin: ${data.train.obs_offset_margin}
     skip_padding_as_possible: true
 
 # scheduler

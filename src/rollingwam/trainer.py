@@ -391,7 +391,20 @@ class Wan22Trainer:
         with self.accelerator.autocast():
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
-        
+
+        # crop the obs-offset margin so the rollout matches the trained window
+        margin = int(getattr(model, "obs_offset_range", 0))
+        if margin > 0:
+            sample = dict(sample)
+            n_frames_all = sample["video"].shape[2]
+            sample["video"] = sample["video"][:, :, margin:-margin]
+            for key in ("action", "action_is_pad", "proprio"):
+                if sample.get(key, None) is not None:
+                    apt = sample[key].shape[1] // (n_frames_all - 1)
+                    sample[key] = sample[key][:, margin * apt : -(margin * apt)]
+            if sample.get("action", None) is not None:
+                sample["action_horizon"] = int(sample["action"].shape[1])
+
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
@@ -616,11 +629,20 @@ class Wan22Trainer:
                         "State file `%s` has no rolling config; compatibility cannot be checked.",
                         state_file,
                     )
-                elif saved_rolling != model.get_rolling_config():
-                    raise ValueError(
-                        "RollingWAM config mismatch for full training resume: "
-                        f"checkpoint={saved_rolling}, current={model.get_rolling_config()}"
-                    )
+                else:
+                    current_rolling = model.get_rolling_config()
+                    missing = sorted(set(current_rolling) - set(saved_rolling))
+                    if missing:
+                        logger.warning(
+                            "State file rolling config predates %s; keeping the current values.",
+                            missing,
+                        )
+                        saved_rolling = {**{k: current_rolling[k] for k in missing}, **saved_rolling}
+                    if saved_rolling != current_rolling:
+                        raise ValueError(
+                            "RollingWAM config mismatch for full training resume: "
+                            f"checkpoint={saved_rolling}, current={current_rolling}"
+                        )
 
         self.accelerator.load_state(input_dir=state_dir)
         if payload is not None:
