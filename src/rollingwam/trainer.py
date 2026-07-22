@@ -371,6 +371,20 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
+        # pad masks flow through so val loss masks padding like train loss
+        pads = {}
+        for key in ("image_is_pad", "action_is_pad"):
+            mask = sample.get(key, None)
+            if mask is None:
+                continue
+            if not isinstance(mask, torch.Tensor):
+                raise TypeError(f"`sample['{key}']` must be a torch.Tensor, got {type(mask)}")
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0)
+            if mask.ndim != 2:
+                raise ValueError(f"`sample['{key}']` must be 1D [T] or 2D [B, T], got {tuple(mask.shape)}")
+            pads[key] = mask
+
         return {
             "video": video,
             "prompt": prompt,
@@ -379,6 +393,7 @@ class Wan22Trainer:
             "context": context,
             "context_mask": context_mask,
             "action_horizon": action_horizon,
+            **pads,
         }
 
     @torch.no_grad()
@@ -406,6 +421,8 @@ class Wan22Trainer:
             sample = dict(sample)
             n_frames_all = sample["video"].shape[2]
             sample["video"] = sample["video"][:, :, margin:-margin]
+            if sample.get("image_is_pad", None) is not None:
+                sample["image_is_pad"] = sample["image_is_pad"][:, margin:-margin]
             for key in ("action", "action_is_pad", "proprio"):
                 if sample.get(key, None) is not None:
                     apt = sample[key].shape[1] // (n_frames_all - 1)
@@ -416,7 +433,7 @@ class Wan22Trainer:
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
-        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
+        proprio = sample["proprio"][0] if "proprio" in sample and sample["proprio"] is not None else None # [1, T, d] -> [T, d], indexed per chunk in the rollout
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
 

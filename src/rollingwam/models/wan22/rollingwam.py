@@ -963,17 +963,32 @@ class RollingWAM(WAM):
         if context_mask is not None and context_mask.ndim == 1:
             context_mask = context_mask.unsqueeze(0)
 
+        if proprio is not None:
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim == 3:
+                if proprio.shape[0] != 1:
+                    raise ValueError(f"`proprio` batch must be 1, got {tuple(proprio.shape)}")
+                proprio = proprio[0]
+            if proprio.ndim != 2:
+                raise ValueError(f"`proprio` must be [d], [1,d], [T,d] or [1,T,d], got {tuple(proprio.shape)}")
+
         self.rolling_reset()
         emitted_video: list[torch.Tensor] = []
         emitted_action: list[torch.Tensor] = []
         anchor_latent = self._encode_input_image_latents_tensor(input_image=input_image)
         frames = input_image.unsqueeze(2)  # [1, 3, 1, H, W]
         for chunk_index in range(num_chunks):
+            chunk_proprio = None
+            if proprio is not None:
+                step = min(chunk_index * self.actions_per_chunk, proprio.shape[0] - 1)
+                chunk_proprio = proprio[step]
+
             out = self.rolling_act(
                 new_frames=frames,
                 context=context,
                 context_mask=context_mask,
-                proprio=proprio,
+                proprio=chunk_proprio,
                 negative_prompt=negative_prompt,
                 text_cfg_scale=text_cfg_scale,
                 seed=seed,
