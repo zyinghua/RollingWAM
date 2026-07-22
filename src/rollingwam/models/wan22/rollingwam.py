@@ -431,7 +431,12 @@ class RollingWAM(WAM):
             raise ValueError("`sample['video']` must be a batched tensor.")
         batch_size = int(video.shape[0])
         H, W = self.num_context_chunks, self.window_blocks
-        h_cpu, init_cpu = self._sample_training_layouts(batch_size)
+        if self.dit.training:
+            h_cpu, init_cpu = self._sample_training_layouts(batch_size)
+        else:
+            # deterministic val: steady layout at the slide-start state (t = 1)
+            h_cpu = torch.full((batch_size,), H, dtype=torch.long)
+            init_cpu = torch.zeros(batch_size, dtype=torch.bool)
 
         sample, dev = self._apply_obs_offset(
             sample,
@@ -490,7 +495,10 @@ class RollingWAM(WAM):
         has_structural_padding = bool((h_cpu < H).any().item())
         n_steps = float(self.train_video_scheduler.num_train_timesteps)
 
-        t_global = torch.rand((batch_size, 1), device=device)
+        if self.dit.training:
+            t_global = torch.rand((batch_size, 1), device=device)
+        else:
+            t_global = torch.ones((batch_size, 1), device=device)
         slots = torch.arange(W, device=device, dtype=torch.float32).view(1, W)
         u_steady = (slots + t_global) / W
         u_init = (slots / W + t_global).clamp(max=1.0)
