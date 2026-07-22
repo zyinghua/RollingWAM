@@ -68,7 +68,7 @@ rolling:
   # history routing, only active when num_context_chunks > 0. split: window actions read
   # executed-action history, video reads video history; shared: both read video history
   history_context_routing: split
-  partial_window_prob: 0.2
-  partial_context_prob: 0.0  # only meaningful when num_context_chunks > 0
+  init_schedule_prob: 0.2  # P(t_init); paper-prose beta=P(t_lin)=1-init_schedule_prob
+  partial_context_prob: 0.0  # only meaningful when num_context_chunks > 1
   obs_offset_prob: 0.0  # chance to noise the window from a time-shifted clip (supervision stays GT); 0 disables the augmentation entirely (range and data margin auto-zeroed)
   obs_offset_range: 4  # max |offset| in video frames (1 video frame = action_video_freq_ratio raw steps)
