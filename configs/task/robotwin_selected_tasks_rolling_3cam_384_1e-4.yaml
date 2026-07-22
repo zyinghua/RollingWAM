@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 # dataloading
-batch_size: 8
+batch_size: 4
 num_workers: 4
 
 model:
@@ -33,6 +33,6 @@ save_every: 250
 eval_every: 500
 
 # training
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 8
 weight_decay: 1e-2
 resume: null
