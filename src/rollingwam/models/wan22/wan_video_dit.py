@@ -555,7 +555,7 @@ class WanVideoDiT(torch.nn.Module):
                 ) * timestep.view(batch_size, 1, 1)
                 token_timesteps[:, 0, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
-            token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
+            token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1).to(x.dtype))
             t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
             t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
         else:

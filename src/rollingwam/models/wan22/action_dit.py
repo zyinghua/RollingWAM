@@ -282,6 +282,7 @@ class ActionDiT(nn.Module):
                 f"Action token length {seq_len} exceeds RoPE cache {self.freqs.shape[0]}."
             )
 
+        timestep = timestep.to(action_tokens.dtype)  # sinusoid inherits the timestep dtype
         if timestep.ndim == 2:
             # Per-token timesteps (rolling: per-chunk rungs expanded over action tokens).
             t = self.time_embedding(
