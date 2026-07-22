@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin_selected_tasks
+  - override /model: rollingwam
+  - _self_
+
+# dataloading
+batch_size: 8
+num_workers: 4
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+data:
+  train:
+    # raw steps for the model window: ratio * 4 (VAE temporal factor) * chunk_latents * (W+H) + 1
+    num_frames: ${eval:'${data.train.action_video_freq_ratio} * 4 * ${model.rolling.chunk_latents} * (${model.rolling.window_blocks} + ${model.rolling.num_context_chunks}) + 1'}
+    obs_offset_margin: ${eval:'${model.rolling.obs_offset_range} if ${model.rolling.obs_offset_prob} > 0 else 0'}
+    skip_padding_as_possible: true
+  val:
+    num_frames: ${data.train.num_frames}
+    obs_offset_margin: ${data.train.obs_offset_margin}
+    skip_padding_as_possible: true
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 250
+eval_every: 500
+
+# training
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null
