@@ -11,12 +11,12 @@ logger = get_logger(__name__)
 
 class RollingWAM(WAM):
     """Rolling-diffusion WAM: a sliding window of chunks denoised jointly under a
-    diagonal noise ramp (front cleanest), conditioned on clean history.
+    diagonal noise ramp (front cleanest), conditioned on clean video history.
 
     Sequence layout (video latents): [anchor frame | h context chunks | win window chunks],
     one chunk = `chunk_latents` latent frames. Actions pair per window chunk. Attention:
-    anchor self-attends; context is block-causal, video-only; the window is bidirectional;
-    action chunk i attends all video + its own chunk's actions.
+    anchor self-attends; context is block-causal; window video is bidirectional over video;
+    action chunk i attends all video + its own chunk's actions; video never attends actions.
     """
 
     def __init__(self, *args, **kwargs):
@@ -29,8 +29,6 @@ class RollingWAM(WAM):
         num_context_chunks: int = 0,
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
-        video_attends_actions: bool = True,
-        history_context_routing: str = "split",
         init_schedule_prob: float = 0.0,
         partial_context_prob: float = 0.0,
         obs_offset_prob: float = 0.0,
@@ -68,8 +66,6 @@ class RollingWAM(WAM):
                 f"init_schedule_prob + partial_context_prob must be <= 1, got "
                 f"{init_schedule_prob} + {partial_context_prob}"
             )
-        if history_context_routing not in ("split", "shared"):
-            raise ValueError(f"`history_context_routing` must be 'split' or 'shared', got {history_context_routing!r}")
         if not 0.0 <= obs_offset_prob <= 1.0:
             raise ValueError(f"`obs_offset_prob` must be in [0, 1], got {obs_offset_prob}")
         if obs_offset_range < 0:
@@ -94,8 +90,6 @@ class RollingWAM(WAM):
         self.num_context_chunks = int(num_context_chunks)
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
-        self.video_attends_actions = bool(video_attends_actions)
-        self.history_context_routing = str(history_context_routing)
         self.init_schedule_prob = float(init_schedule_prob)
         self.partial_context_prob = float(partial_context_prob)
         self.obs_offset_prob = float(obs_offset_prob)
@@ -120,7 +114,6 @@ class RollingWAM(WAM):
 
     ROLLING_KEYS = (
         "window_blocks", "num_context_chunks", "chunk_latents", "actions_per_chunk",
-        "video_attends_actions", "history_context_routing",
         "init_schedule_prob", "partial_context_prob", "obs_offset_prob", "obs_offset_range",
     )
 
@@ -214,16 +207,11 @@ class RollingWAM(WAM):
         tokens_per_frame: int,
         actions_per_chunk: int,
         device: torch.device,
-        action_ctx_chunks: int = 0,
     ) -> torch.Tensor:
-        """action_ctx_chunks > 0 = split routing: the action stream carries its own clean
-        executed-action history, window actions read THAT instead of the video context
-        (video history stays visible to window video only). 0 = shared routing: window
-        actions read the video context directly."""
         nfpb = self.chunk_latents
         video_frames = 1 + (ctx_chunks + win_chunks) * nfpb
         video_seq_len = video_frames * tokens_per_frame
-        action_seq_len = (action_ctx_chunks + win_chunks) * actions_per_chunk
+        action_seq_len = win_chunks * actions_per_chunk
         total = video_seq_len + action_seq_len
 
         frame_chunk = torch.full((video_frames,), -1, dtype=torch.long, device=device)
@@ -239,29 +227,13 @@ class RollingWAM(WAM):
         mask[:tokens_per_frame, :video_seq_len] = False
         mask[:tokens_per_frame, :tokens_per_frame] = True                # anchor self-attends only
 
-        a_chunk = torch.arange(action_ctx_chunks + win_chunks, device=device).repeat_interleave(actions_per_chunk)
-        a_is_hist = a_chunk < action_ctx_chunks
+        a_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)
         a = slice(video_seq_len, total)
 
-        av = torch.zeros((action_seq_len, video_seq_len), dtype=torch.bool, device=device)
-        if action_ctx_chunks > 0:
-            av[~a_is_hist] = (token_chunk < 0) | (token_chunk >= ctx_chunks)
-        else:
-            av[~a_is_hist] = True
-        av[a_is_hist, :tokens_per_frame] = True
-        mask[a, v] = av
+        mask[a, v] = True
 
-        aa = torch.zeros((action_seq_len, action_seq_len), dtype=torch.bool, device=device)
         same_chunk = a_chunk.view(-1, 1) == a_chunk.view(1, -1)
-        aa[~a_is_hist] = a_is_hist.view(1, -1) | same_chunk[~a_is_hist]
-        aa[a_is_hist] = a_is_hist.view(1, -1) & (a_chunk.view(1, -1) <= a_chunk[a_is_hist].view(-1, 1))
-        mask[a, a] = aa
-
-        if self.video_attends_actions:
-            win_a_chunk = a_chunk - action_ctx_chunks
-            mask[v, a] = (
-                token_chunk.view(-1, 1) == (ctx_chunks + win_a_chunk.view(1, -1))
-            ) & (~a_is_hist).view(1, -1)
+        mask[a, a] = same_chunk
         return mask
 
     @torch.no_grad()
@@ -276,9 +248,8 @@ class RollingWAM(WAM):
             raise ValueError(f"`ctx_chunks` must be 1D [B], got {tuple(ctx_chunks.shape)}")
 
         H, W = self.num_context_chunks, self.window_blocks
-        split = self.history_context_routing == "split"
         max_video_len = (1 + (H + W) * self.chunk_latents) * tokens_per_frame
-        max_action_len = ((H + W) if split else W) * actions_per_chunk
+        max_action_len = W * actions_per_chunk
         total_len = max_video_len + max_action_len
 
         masks = {}
@@ -286,16 +257,14 @@ class RollingWAM(WAM):
         for h in set(h_values):
             if not 0 <= h <= H:
                 raise ValueError(f"Context chunks must be in [0, {H}], got {h}")
-            ha = h if split else 0
             video_len = (1 + (h + W) * self.chunk_latents) * tokens_per_frame
-            action_len = (ha + W) * actions_per_chunk
+            action_len = W * actions_per_chunk
             compact = self._build_rolling_attention_mask(
                 ctx_chunks=h,
                 win_chunks=W,
                 tokens_per_frame=tokens_per_frame,
                 actions_per_chunk=actions_per_chunk,
                 device=device,
-                action_ctx_chunks=ha,
             )
             mask = torch.eye(total_len, dtype=torch.bool, device=device)
             mask[:video_len, :video_len] = compact[:video_len, :video_len]
@@ -601,27 +570,8 @@ class RollingWAM(WAM):
         noisy_window_action = (1 - sigma_action) * base_action + sigma_action * noise_action
         target_action = noise_action - window_action
 
-        if self.history_context_routing == "split":
-            action_position = torch.arange(action.shape[1], device=device).view(1, -1)
-            active_action_len = (h + W) * aspc
-            padded_action = action
-            if has_structural_padding:
-                active_action = action_position < active_action_len.view(-1, 1)
-                padded_action = torch.where(
-                    active_action.unsqueeze(-1), action, torch.randn_like(action)
-                )
-            action_tokens = padded_action.scatter(1, action_gather_idx, noisy_window_action)
-            timestep_action = torch.full(
-                (batch_size, action.shape[1]), n_steps, dtype=torch.float32, device=device
-            )
-            timestep_action = torch.where(
-                action_position < (h * aspc).view(-1, 1),
-                torch.zeros_like(timestep_action),
-                timestep_action,
-            ).scatter(1, window_action_idx, t_window_action)
-        else:
-            action_tokens = noisy_window_action
-            timestep_action = t_window_action
+        action_tokens = noisy_window_action
+        timestep_action = t_window_action
 
         video_pre = self.video_expert.pre_dit(
             x=noisy_latents,
@@ -686,12 +636,8 @@ class RollingWAM(WAM):
             (video_loss_frame * video_weight * video_loss_mask).sum(dim=1) / valid_sum
         ).mean()
 
-        if self.history_context_routing == "split":
-            pred_action_window = torch.gather(pred_action, 1, action_gather_idx)
-        else:
-            pred_action_window = pred_action
         action_loss_token = torch.nn.functional.mse_loss(
-            pred_action_window.float(), target_action.float(), reduction="none"
+            pred_action.float(), target_action.float(), reduction="none"
         ).mean(dim=2)
 
         action_weight = self.train_action_scheduler.training_weight(
@@ -729,7 +675,6 @@ class RollingWAM(WAM):
         self._window_action: Optional[torch.Tensor] = None    # [1, win*aspc, action_dim]
         self._rungs: list[int] = []
         self._raw_frames: Optional[torch.Tensor] = None       # [1, 3, N, H, W] in [-1, 1]
-        self._executed_actions: list[torch.Tensor] = []        # emitted chunks, newest last
         self._stream_steps: Optional[int] = None               # S locked for the episode
         self._push_count: int = 0
         self._cached_context: Optional[tuple] = None
@@ -762,8 +707,6 @@ class RollingWAM(WAM):
         self._window_latents = self._window_latents[:, :, nfpb:]
         self._window_action = self._window_action[:, aspc:]
         self._rungs = self._rungs[1:]
-        self._executed_actions.append(act.detach().clone())
-        self._executed_actions = self._executed_actions[-self.num_context_chunks :] if self.num_context_chunks > 0 else []
         return video, act
 
     @torch.no_grad()
@@ -793,27 +736,12 @@ class RollingWAM(WAM):
         win = len(self._rungs)
         h = (ctx_latents.shape[2] - 1) // nfpb
 
-        if self.history_context_routing == "split" and self._executed_actions:
-            ctx_actions = torch.cat(self._executed_actions, dim=1)
-            ha = ctx_actions.shape[1] // aspc
-        else:
-            ctx_actions, ha = None, 0
-
         latents = torch.cat([ctx_latents, self._window_latents], dim=2)
         rungs = torch.tensor(self._rungs, device=self.device)
         t_chunk = ladder_t[rungs].to(torch.float32)                              # [win]
         timestep_video = torch.zeros((1, latents.shape[2]), dtype=torch.float32, device=self.device)
         timestep_video[0, ctx_latents.shape[2]:] = t_chunk.repeat_interleave(nfpb)
         t_window_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)           # [1, win*aspc]
-        if ha > 0:
-            action_tokens = torch.cat([ctx_actions, self._window_action], dim=1)
-            timestep_action = torch.cat(
-                [torch.zeros((1, ha * aspc), dtype=torch.float32, device=self.device), t_window_action],
-                dim=1,
-            )
-        else:
-            action_tokens = self._window_action
-            timestep_action = t_window_action
 
         def predict(ctx, ctx_mask):
             video_pre = self.video_expert.pre_dit(
@@ -826,8 +754,8 @@ class RollingWAM(WAM):
                 ),
             )
             action_pre = self.action_expert.pre_dit(
-                action_tokens=action_tokens,
-                timestep=timestep_action,
+                action_tokens=self._window_action,
+                timestep=t_window_action,
                 context=ctx,
                 context_mask=ctx_mask,
             )
@@ -837,7 +765,6 @@ class RollingWAM(WAM):
                 tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
                 actions_per_chunk=aspc,
                 device=self.device,
-                action_ctx_chunks=ha,
             )
             tokens_out = self.mot(
                 embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
@@ -862,7 +789,6 @@ class RollingWAM(WAM):
 
         adv = [True] * win if advance is None else advance
         pred_window = pred_video[:, :, ctx_latents.shape[2]:]
-        pred_action_window = pred_action[:, ha * aspc :]
         for j, r in enumerate(self._rungs):
             if not adv[j]:
                 continue
@@ -870,7 +796,7 @@ class RollingWAM(WAM):
             vs = slice(j * nfpb, (j + 1) * nfpb)
             self._window_latents[:, :, vs] += pred_window[:, :, vs] * delta
             as_ = slice(j * aspc, (j + 1) * aspc)
-            self._window_action[:, as_] += pred_action_window[:, as_] * delta
+            self._window_action[:, as_] += pred_action[:, as_] * delta
         self._rungs = [r + 1 if a else r for r, a in zip(self._rungs, adv)]
 
     @torch.no_grad()
