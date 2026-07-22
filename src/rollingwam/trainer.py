@@ -43,6 +43,12 @@ class Wan22Trainer:
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        window_blocks = getattr(model, "window_blocks", None)
+        if window_blocks is not None and self.eval_num_inference_steps % int(window_blocks) != 0:
+            raise ValueError(
+                f"`eval_num_inference_steps` ({self.eval_num_inference_steps}) must be divisible by "
+                f"`model.rolling.window_blocks` ({window_blocks}); otherwise the first eval fails mid-run."
+            )
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)

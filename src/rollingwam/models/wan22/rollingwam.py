@@ -968,7 +968,7 @@ class RollingWAM(WAM):
         emitted_action: list[torch.Tensor] = []
         anchor_latent = self._encode_input_image_latents_tensor(input_image=input_image)
         frames = input_image.unsqueeze(2)  # [1, 3, 1, H, W]
-        for _ in range(num_chunks):
+        for chunk_index in range(num_chunks):
             out = self.rolling_act(
                 new_frames=frames,
                 context=context,
@@ -981,7 +981,10 @@ class RollingWAM(WAM):
             )
             emitted_action.append(out["action"])
             emitted_video.append(out["video"])
-            # VAE maps 1+k latents <-> 1+4k frames; an isolated chunk decodes wrong
+
+            if chunk_index + 1 == num_chunks:
+                break
+
             stream = torch.cat([anchor_latent] + emitted_video, dim=2)
             decoded = self._decode_latents_tensor(stream)
             frames = decoded[:, :, -int(self.vae.temporal_downsample_factor) * out["video"].shape[2] :]
