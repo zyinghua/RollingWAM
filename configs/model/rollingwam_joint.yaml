@@ -1,0 +1,70 @@
+_target_: rollingwam.runtime.create_rollingwam_joint
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+skip_dit_load_from_pretrain: false
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "bidirectional"  # rolling mask is built by the model
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+# linear: sigma_shift = 1.0
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_action: 1.0
+
+rolling:
+  window_blocks: 5
+  num_context_chunks: 0  # 0 = latest-frame conditioning only; >0 adds clean video-history chunks
+  chunk_latents: 1
+  # derived: 4 (VAE temporal factor) * chunk_latents * actions per video frame
+  actions_per_chunk: ${eval:'4 * ${model.rolling.chunk_latents} * ${data.train.action_video_freq_ratio}'}
+  init_schedule_prob: 0.2  # P(t_init); paper-prose beta=P(t_lin)=1-init_schedule_prob
+  partial_context_prob: 0.25  # only meaningful when num_context_chunks > 1
+  obs_offset_prob: 0.0  # chance to noise the window from a time-shifted clip (supervision stays GT); 0 disables the augmentation entirely (range and data margin auto-zeroed)
+  obs_offset_range: 4  # max |offset| in video frames (1 video frame = action_video_freq_ratio raw steps)

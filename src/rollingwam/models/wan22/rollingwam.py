@@ -10,14 +10,7 @@ logger = get_logger(__name__)
 
 
 class RollingWAM(WAM):
-    """Rolling-diffusion WAM: a sliding window of chunks denoised jointly under a
-    diagonal noise ramp (front cleanest), conditioned on clean video history.
-
-    Sequence layout (video latents): [anchor frame | h context chunks | win window chunks],
-    one chunk = `chunk_latents` latent frames. Actions pair per window chunk. Attention:
-    anchor self-attends; context is block-causal; window video is bidirectional over video;
-    action chunk i attends all video + its own chunk's actions; video never attends actions.
-    """
+    """MoT world model with video/action experts in rolling window style."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -125,6 +118,7 @@ class RollingWAM(WAM):
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "variant": type(self).__name__,
             "rolling": self.get_rolling_config(),
             "scheduler": {
                 "shift": self.train_video_scheduler.shift,
@@ -139,6 +133,13 @@ class RollingWAM(WAM):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = super().load_checkpoint(path, optimizer=optimizer)
+
+        saved_variant = payload.get("variant")
+        if saved_variant is not None and saved_variant != type(self).__name__:
+            raise ValueError(
+                f"Checkpoint was trained as {saved_variant} but the model is {type(self).__name__}; "
+                "the joint/non-joint variants use different attention masks. Fix the model yaml."
+            )
 
         saved_sched = payload.get("scheduler")
         if saved_sched is not None:
@@ -207,15 +208,17 @@ class RollingWAM(WAM):
         tokens_per_frame: int,
         actions_per_chunk: int,
         device: torch.device,
+        video_rollout: bool = True,
     ) -> torch.Tensor:
         nfpb = self.chunk_latents
-        video_frames = 1 + (ctx_chunks + win_chunks) * nfpb
+        video_chunks = ctx_chunks + (win_chunks if video_rollout else 0)
+        video_frames = 1 + video_chunks * nfpb
         video_seq_len = video_frames * tokens_per_frame
         action_seq_len = win_chunks * actions_per_chunk
         total = video_seq_len + action_seq_len
 
         frame_chunk = torch.full((video_frames,), -1, dtype=torch.long, device=device)
-        frame_chunk[1:] = torch.arange((ctx_chunks + win_chunks) * nfpb, device=device) // nfpb
+        frame_chunk[1:] = torch.arange(video_chunks * nfpb, device=device) // nfpb
         token_chunk = frame_chunk.repeat_interleave(tokens_per_frame)
         is_window_token = token_chunk >= ctx_chunks
 
@@ -227,13 +230,9 @@ class RollingWAM(WAM):
         mask[:tokens_per_frame, :video_seq_len] = False
         mask[:tokens_per_frame, :tokens_per_frame] = True                # anchor self-attends only
 
-        a_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)
         a = slice(video_seq_len, total)
-
-        mask[a, v] = True
-
-        same_chunk = a_chunk.view(-1, 1) == a_chunk.view(1, -1)
-        mask[a, a] = same_chunk
+        mask[a, v] = (token_chunk < ctx_chunks).view(1, -1)              # clean video only (anchor + context)
+        mask[a, a] = True                                                # bidirectional over window actions
         return mask
 
     @torch.no_grad()
@@ -688,34 +687,42 @@ class RollingWAM(WAM):
         self._cached_context: Optional[tuple] = None
         self._cached_negative: Optional[tuple] = None
 
-    def _push_noise_chunk(self, z: int, latent_h: int, latent_w: int, aspc: int, seed: Optional[int]):
-        """Append a pure-noise chunk (video + action) at the back of the window, rung 0.
+    def _push_noise_chunk(
+        self, z: int, latent_h: int, latent_w: int, aspc: int, seed: Optional[int], video: bool = True
+    ):
+        """Append a pure-noise chunk at the back of the window, rung 0.
         Deterministic per-push seed keeps CFG ranks and reruns identical."""
         gen = None
         if seed is not None:
             gen = torch.Generator(device="cpu").manual_seed(seed + self._push_count)
         self._push_count += 1
-        v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen).to(
-            device=self.device, dtype=self.torch_dtype
-        )
+        if video:
+            v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+            if self._window_latents is None or self._window_latents.shape[2] == 0:
+                self._window_latents = v
+            else:
+                self._window_latents = torch.cat([self._window_latents, v], dim=2)
         a = torch.randn((1, aspc, self.action_expert.action_dim), generator=gen).to(
             device=self.device, dtype=self.torch_dtype
         )
-        if self._window_latents is None or self._window_latents.shape[2] == 0:
-            self._window_latents, self._window_action = v, a
+        if self._window_action is None or self._window_action.shape[1] == 0:
+            self._window_action = a
         else:
-            self._window_latents = torch.cat([self._window_latents, v], dim=2)
             self._window_action = torch.cat([self._window_action, a], dim=1)
         self._rungs.append(0)
 
-    def _pop_front_chunk(self, aspc: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _pop_front_chunk(self, aspc: int, video: bool = True) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         nfpb = self.chunk_latents
-        video = self._window_latents[:, :, :nfpb]
+        front = None
+        if video:
+            front = self._window_latents[:, :, :nfpb]
+            self._window_latents = self._window_latents[:, :, nfpb:]
         act = self._window_action[:, :aspc]
-        self._window_latents = self._window_latents[:, :, nfpb:]
         self._window_action = self._window_action[:, aspc:]
         self._rungs = self._rungs[1:]
-        return video, act
+        return front, act
 
     @torch.no_grad()
     def _encode_context_latents(self) -> torch.Tensor:
@@ -737,18 +744,24 @@ class RollingWAM(WAM):
         negative_context: Optional[torch.Tensor] = None,
         negative_context_mask: Optional[torch.Tensor] = None,
         advance: Optional[list] = None,
+        video_rollout: bool = True,
     ):
         """One denoise pass over the window against clean context; advances every rung by 1.
-        `advance[j]=False` freezes chunk j (boundary init phase: clipped chunks stay pure noise)."""
+        `advance[j]=False` freezes chunk j (boundary init phase: clipped chunks stay pure noise).
+        `video_rollout=False` rolls actions only; the video stream is just the clean context."""
         nfpb = self.chunk_latents
         win = len(self._rungs)
         h = (ctx_latents.shape[2] - 1) // nfpb
 
-        latents = torch.cat([ctx_latents, self._window_latents], dim=2)
+        if video_rollout:
+            latents = torch.cat([ctx_latents, self._window_latents], dim=2)
+        else:
+            latents = ctx_latents
         rungs = torch.tensor(self._rungs, device=self.device)
         t_chunk = ladder_t[rungs].to(torch.float32)                              # [win]
         timestep_video = torch.zeros((1, latents.shape[2]), dtype=torch.float32, device=self.device)
-        timestep_video[0, ctx_latents.shape[2]:] = t_chunk.repeat_interleave(nfpb)
+        if video_rollout:
+            timestep_video[0, ctx_latents.shape[2]:] = t_chunk.repeat_interleave(nfpb)
         t_window_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)           # [1, win*aspc]
 
         def predict(ctx, ctx_mask):
@@ -773,6 +786,7 @@ class RollingWAM(WAM):
                 tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
                 actions_per_chunk=aspc,
                 device=self.device,
+                video_rollout=video_rollout,
             )
             tokens_out = self.mot(
                 embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
@@ -790,19 +804,20 @@ class RollingWAM(WAM):
             )
 
         pred_video, pred_action = predict(context, context_mask)
-        if text_cfg_scale != 1.0 and negative_context is not None:
+        if video_rollout and text_cfg_scale != 1.0 and negative_context is not None:
             pred_video_neg, _ = predict(negative_context, negative_context_mask)
             pred_video = pred_video_neg + text_cfg_scale * (pred_video - pred_video_neg)
             # action keeps the conditional prediction
 
         adv = [True] * win if advance is None else advance
-        pred_window = pred_video[:, :, ctx_latents.shape[2]:]
+        pred_window = pred_video[:, :, ctx_latents.shape[2]:] if video_rollout else None
         for j, r in enumerate(self._rungs):
             if not adv[j]:
                 continue
             delta = ladder_delta[r]
-            vs = slice(j * nfpb, (j + 1) * nfpb)
-            self._window_latents[:, :, vs] += pred_window[:, :, vs] * delta
+            if video_rollout:
+                vs = slice(j * nfpb, (j + 1) * nfpb)
+                self._window_latents[:, :, vs] += pred_window[:, :, vs] * delta
             as_ = slice(j * aspc, (j + 1) * aspc)
             self._window_action[:, as_] += pred_action[:, as_] * delta
         self._rungs = [r + 1 if a else r for r, a in zip(self._rungs, adv)]
@@ -820,14 +835,37 @@ class RollingWAM(WAM):
         seed: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
     ) -> dict[str, Any]:
-        """One control step: feed newly observed frames, get the next action chunk.
+        """One deployment step: feed the frames observed since the last call, get the next
+        action chunk. Only actions are denoised — no video is generated (world modeling is
+        a training-time objective). Returns {'action': [actions_per_chunk, action_dim],
+        'video': None}."""
+        return self._rolling_act(
+            new_frames=new_frames,
+            prompt=prompt,
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+            negative_prompt=negative_prompt,
+            text_cfg_scale=text_cfg_scale,
+            seed=seed,
+            num_inference_steps=num_inference_steps,
+            video_rollout=False,
+        )
 
-        First call: `new_frames` [1, 3, 1, H, W] (single observation) — runs the boundary
-        init phase (full window denoised from pure noise into the rolling state).
-        Later calls: [1, 3, 4*chunk_latents, H, W] (the frames observed while executing
-        the previous chunk). Returns {'action': [aspc, action_dim], 'video': predicted
-        front chunk latents}.
-        """
+    @torch.no_grad()
+    def _rolling_act(
+        self,
+        new_frames: torch.Tensor,
+        prompt: Optional[str] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        seed: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        video_rollout: bool = True,
+    ) -> dict[str, Any]:
         self.eval()
         if new_frames.ndim != 5 or new_frames.shape[0] != 1 or new_frames.shape[1] != 3:
             raise ValueError(f"`new_frames` must be [1, 3, T, H, W], got {tuple(new_frames.shape)}")
@@ -899,25 +937,27 @@ class RollingWAM(WAM):
             # boundary init phase (t^init): full window of pure noise; chunk j stays
             # clipped at sigma=1 until pass j*sub, then advances one rung per pass
             for _ in range(W):
-                self._push_noise_chunk(z, latent_h, latent_w, aspc, seed)
+                self._push_noise_chunk(z, latent_h, latent_w, aspc, seed, video=video_rollout)
             for p in range(S):
                 self._window_pass(
                     ctx_latents, context, context_mask, ladder_t, ladder_delta, aspc,
                     text_cfg_scale, negative_context, negative_context_mask,
                     advance=[p >= j * sub for j in range(W)],
+                    video_rollout=video_rollout,
                 )
         else:
-            self._push_noise_chunk(z, latent_h, latent_w, aspc, seed)
+            self._push_noise_chunk(z, latent_h, latent_w, aspc, seed, video=video_rollout)
             for _ in range(sub):
                 self._window_pass(
                     ctx_latents, context, context_mask, ladder_t, ladder_delta, aspc,
                     text_cfg_scale, negative_context, negative_context_mask,
+                    video_rollout=video_rollout,
                 )
 
-        video_front, action_front = self._pop_front_chunk(aspc)
+        video_front, action_front = self._pop_front_chunk(aspc, video=video_rollout)
         return {
             "action": action_front[0].detach().to(device="cpu", dtype=torch.float32),
-            "video": video_front.detach(),
+            "video": None if video_front is None else video_front.detach(),
         }
 
     # ------------------------------------------------------------------ open-loop eval
@@ -984,7 +1024,7 @@ class RollingWAM(WAM):
                 step = min(chunk_index * self.actions_per_chunk, proprio.shape[0] - 1)
                 chunk_proprio = proprio[step]
 
-            out = self.rolling_act(
+            out = self._rolling_act(
                 new_frames=frames,
                 context=context,
                 context_mask=context_mask,
@@ -993,6 +1033,7 @@ class RollingWAM(WAM):
                 text_cfg_scale=text_cfg_scale,
                 seed=seed,
                 num_inference_steps=num_inference_steps,
+                video_rollout=True,
             )
             emitted_action.append(out["action"])
             emitted_video.append(out["video"])
