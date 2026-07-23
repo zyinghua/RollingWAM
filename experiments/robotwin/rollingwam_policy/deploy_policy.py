@@ -25,8 +25,11 @@ if str(SRC_ROOT) not in sys.path:
 from rollingwam.datasets.lerobot.processors.rollingwam_processor import RollingWAMProcessor
 from rollingwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from rollingwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from rollingwam.utils.config_resolvers import register_default_resolvers
 
 logger = logging.getLogger(__name__)
+
+register_default_resolvers()
 
 
 def _is_none_like(value: Any) -> bool:
@@ -263,7 +266,9 @@ class WorldActionRobotWinPolicy:
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     def should_request_observation(self) -> bool:
-        return True
+        if self.context_chunks > 0:
+            return True
+        return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
         if observation is not None and self._episode_started:
