@@ -866,7 +866,10 @@ class RollingWAM(WAM):
         num_inference_steps: Optional[int] = None,
         video_rollout: bool = True,
     ) -> dict[str, Any]:
-        self.eval()
+        # Deployment normally sets eval mode once when the model is loaded. Avoid
+        # recursively traversing the full module tree again on every replan.
+        if self.training:
+            self.eval()
         if new_frames.ndim != 5 or new_frames.shape[0] != 1 or new_frames.shape[1] != 3:
             raise ValueError(f"`new_frames` must be [1, 3, T, H, W], got {tuple(new_frames.shape)}")
 
