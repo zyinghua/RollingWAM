@@ -173,7 +173,16 @@ def main(cfg: DictConfig):
     if task_name_cfg is None or str(task_name_cfg).strip() == "":
         tasks = _load_all_tasks()
     else:
-        tasks = [str(task_name_cfg)]
+        # one task, or a comma-separated list; keep order, drop blanks and duplicates
+        seen: set[str] = set()
+        tasks = []
+        for task in str(task_name_cfg).split(","):
+            task = task.strip()
+            if task and task not in seen:
+                seen.add(task)
+                tasks.append(task)
+        if not tasks:
+            raise ValueError(f"`EVALUATION.task_name` had no valid task after parsing: {task_name_cfg!r}")
 
     extra_overrides = _collect_worker_overrides()
 
