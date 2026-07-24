@@ -152,7 +152,10 @@ def main(cfg: DictConfig):
     max_tasks_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if max_tasks_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
-    gpu_ids = list(range(num_gpus))
+    first_gpu_id = int(cfg.gpu_id)
+    if first_gpu_id < 0:
+        raise ValueError("`gpu_id` must be >= 0.")
+    gpu_ids = list(range(first_gpu_id, first_gpu_id + num_gpus))
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
     run_ts = output_dir.name
