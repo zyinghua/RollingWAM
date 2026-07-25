@@ -19,11 +19,9 @@ class RollingWAM(WAM):
     def configure_rolling(
         self,
         window_blocks: int = 4,
-        num_context_chunks: int = 0,
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
         init_schedule_prob: float = 0.0,
-        partial_context_prob: float = 0.0,
         obs_offset_prob: float = 0.0,
         obs_offset_range: int = 0,
     ):
@@ -41,50 +39,23 @@ class RollingWAM(WAM):
 
         if window_blocks < 1:
             raise ValueError(f"`window_blocks` must be >= 1, got {window_blocks}")
-        if num_context_chunks < 0:
-            raise ValueError(f"`num_context_chunks` must be >= 0, got {num_context_chunks}")
         if chunk_latents < 1:
             raise ValueError(f"`chunk_latents` must be >= 1, got {chunk_latents}")
         if actions_per_chunk < 1:
             raise ValueError(f"`actions_per_chunk` must be >= 1, got {actions_per_chunk}")
-        for name, value in (
-            ("init_schedule_prob", init_schedule_prob),
-            ("partial_context_prob", partial_context_prob),
-        ):
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"`{name}` must be in [0, 1], got {value}")
-        effective_context_prob = partial_context_prob if num_context_chunks > 1 else 0.0
-        if init_schedule_prob + effective_context_prob > 1.0:
-            raise ValueError(
-                f"init_schedule_prob + partial_context_prob must be <= 1, got "
-                f"{init_schedule_prob} + {partial_context_prob}"
-            )
+        if not 0.0 <= init_schedule_prob <= 1.0:
+            raise ValueError(f"`init_schedule_prob` must be in [0, 1], got {init_schedule_prob}")
         if not 0.0 <= obs_offset_prob <= 1.0:
             raise ValueError(f"`obs_offset_prob` must be in [0, 1], got {obs_offset_prob}")
         if obs_offset_range < 0:
             raise ValueError(f"`obs_offset_range` must be >= 0, got {obs_offset_range}")
         if obs_offset_prob > 0 and obs_offset_range == 0:
             raise ValueError("`obs_offset_prob` > 0 requires `obs_offset_range` >= 1")
-        if num_context_chunks > 1 and partial_context_prob <= 0:
-            logger.warning(
-                "num_context_chunks=%d with partial_context_prob=0: inference will visit "
-                "context sizes h=1..%d while the cache fills, but training never shows them. "
-                "Set rolling.partial_context_prob > 0.",
-                num_context_chunks, num_context_chunks - 1,
-            )
-        elif num_context_chunks <= 1 and partial_context_prob > 0:
-            logger.warning(
-                "partial_context_prob=%s has no effect with num_context_chunks=%d; "
-                "boundary init covers h=0 and steady rolling covers h=%d.",
-                partial_context_prob, num_context_chunks, num_context_chunks,
-            )
 
         self.window_blocks = int(window_blocks)
-        self.num_context_chunks = int(num_context_chunks)
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
         self.init_schedule_prob = float(init_schedule_prob)
-        self.partial_context_prob = float(partial_context_prob)
         self.obs_offset_prob = float(obs_offset_prob)
         self.obs_offset_range = int(obs_offset_range) if obs_offset_prob > 0 else 0
         self.rolling_reset()
@@ -106,8 +77,8 @@ class RollingWAM(WAM):
         return model.configure_rolling(**(rolling or {}))
 
     ROLLING_KEYS = (
-        "window_blocks", "num_context_chunks", "chunk_latents", "actions_per_chunk",
-        "init_schedule_prob", "partial_context_prob", "obs_offset_prob", "obs_offset_range",
+        "window_blocks", "chunk_latents", "actions_per_chunk",
+        "init_schedule_prob", "obs_offset_prob", "obs_offset_range",
     )
 
     def get_rolling_config(self) -> dict[str, Any]:
@@ -203,109 +174,37 @@ class RollingWAM(WAM):
     @torch.no_grad()
     def _build_rolling_attention_mask(
         self,
-        ctx_chunks: int,
         win_chunks: int,
         tokens_per_frame: int,
         actions_per_chunk: int,
         device: torch.device,
         video_rollout: bool = True,
     ) -> torch.Tensor:
-        nfpb = self.chunk_latents
-        video_chunks = ctx_chunks + (win_chunks if video_rollout else 0)
-        video_frames = 1 + video_chunks * nfpb
+        video_frames = 1 + (
+            win_chunks * self.chunk_latents if video_rollout else 0
+        )
         video_seq_len = video_frames * tokens_per_frame
         action_seq_len = win_chunks * actions_per_chunk
         total = video_seq_len + action_seq_len
 
-        frame_chunk = torch.full((video_frames,), -1, dtype=torch.long, device=device)
-        frame_chunk[1:] = torch.arange(video_chunks * nfpb, device=device) // nfpb
-        token_chunk = frame_chunk.repeat_interleave(tokens_per_frame)
-        is_window_token = token_chunk >= ctx_chunks
-
         mask = torch.zeros((total, total), dtype=torch.bool, device=device)
-
-        v = slice(0, video_seq_len)
-        mask[v, v] = token_chunk.view(-1, 1) >= token_chunk.view(1, -1)  # block-causal (anchor col included)
-        mask[:video_seq_len, :video_seq_len][is_window_token] = True     # window rows: bidirectional over all video
-        mask[:tokens_per_frame, :video_seq_len] = False
-        mask[:tokens_per_frame, :tokens_per_frame] = True                # anchor self-attends only
-
+        mask[:video_seq_len, :video_seq_len] = True
+        mask[:tokens_per_frame, tokens_per_frame:video_seq_len] = False
         a = slice(video_seq_len, total)
-        mask[a, v] = (token_chunk < ctx_chunks).view(1, -1)              # clean video only (anchor + context)
-        mask[a, a] = True                                                # bidirectional over window actions
+        mask[a, :tokens_per_frame] = True
+        mask[a, a] = True
         return mask
-
-    @torch.no_grad()
-    def _build_training_attention_mask(
-        self,
-        ctx_chunks: torch.Tensor,
-        tokens_per_frame: int,
-        actions_per_chunk: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if ctx_chunks.ndim != 1:
-            raise ValueError(f"`ctx_chunks` must be 1D [B], got {tuple(ctx_chunks.shape)}")
-
-        H, W = self.num_context_chunks, self.window_blocks
-        max_video_len = (1 + (H + W) * self.chunk_latents) * tokens_per_frame
-        max_action_len = W * actions_per_chunk
-        total_len = max_video_len + max_action_len
-
-        masks = {}
-        h_values = [int(value) for value in ctx_chunks.tolist()]
-        for h in set(h_values):
-            if not 0 <= h <= H:
-                raise ValueError(f"Context chunks must be in [0, {H}], got {h}")
-            video_len = (1 + (h + W) * self.chunk_latents) * tokens_per_frame
-            action_len = W * actions_per_chunk
-            compact = self._build_rolling_attention_mask(
-                ctx_chunks=h,
-                win_chunks=W,
-                tokens_per_frame=tokens_per_frame,
-                actions_per_chunk=actions_per_chunk,
-                device=device,
-            )
-            mask = torch.eye(total_len, dtype=torch.bool, device=device)
-            mask[:video_len, :video_len] = compact[:video_len, :video_len]
-            mask[:video_len, max_video_len : max_video_len + action_len] = compact[
-                :video_len, video_len:
-            ]
-            mask[max_video_len : max_video_len + action_len, :video_len] = compact[
-                video_len:, :video_len
-            ]
-            mask[
-                max_video_len : max_video_len + action_len,
-                max_video_len : max_video_len + action_len,
-            ] = compact[video_len:, video_len:]
-            masks[h] = mask
-
-        if len(masks) == 1:
-            return masks[h_values[0]]
-        return torch.stack([masks[h] for h in h_values])
 
     # ------------------------------------------------------------------ training
 
-    def _sample_training_layouts(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample history length and boundary-init schedule per example."""
+    def _sample_init_schedule(self, batch_size: int) -> torch.Tensor:
         if batch_size < 1:
             raise ValueError(f"`batch_size` must be >= 1, got {batch_size}")
-        H = self.num_context_chunks
-        p_i = self.init_schedule_prob
-        p_c = self.partial_context_prob if H > 1 else 0.0
-        r = torch.rand((batch_size,))
-        init = r < p_i
-        context_fill = (r >= p_i) & (r < p_i + p_c)
-        h = torch.full((batch_size,), H, dtype=torch.long)
-        h[init] = 0
-        count = int(context_fill.sum().item())
-        if count > 0:
-            h[context_fill] = torch.randint(1, H, (count,))
-        return h, init
+        return torch.rand((batch_size,)) < self.init_schedule_prob
 
     def _apply_obs_offset(
         self,
         sample: dict,
-        h: torch.Tensor,
         tiled: bool,
         allow_offset: torch.Tensor,
     ):
@@ -321,12 +220,12 @@ class RollingWAM(WAM):
 
         video, action = sample["video"], sample["action"]
         batch_size = video.shape[0]
-        if h.shape != (batch_size,) or allow_offset.shape != (batch_size,):
-            raise ValueError("`h` and `allow_offset` must be 1D tensors matching the batch size.")
+        if allow_offset.shape != (batch_size,):
+            raise ValueError("`allow_offset` must be a 1D tensor matching the batch size.")
         nfpb, aspc = self.chunk_latents, self.actions_per_chunk
         win = self.window_blocks
         tdf = int(self.vae.temporal_downsample_factor)
-        frames = 1 + tdf * nfpb * (self.num_context_chunks + self.window_blocks)
+        frames = 1 + tdf * nfpb * win
         if video.shape[2] != frames + 2 * m:
             raise ValueError(
                 f"obs_offset_range={m} expects {frames + 2 * m} video frames "
@@ -374,11 +273,9 @@ class RollingWAM(WAM):
         width = (o_hi + m + 1).to(torch.float32)
         offset = (torch.rand(batch_size, device=video.device) * width).long() - m
         offset = torch.where(active, offset, torch.zeros_like(offset))
-        h_data = h.to(device=video.device)
         f_idx = m + offset.view(-1, 1) + torch.arange(frames, device=video.device).view(1, -1)
         a_idx = (
             (m + offset).view(-1, 1) * apt
-            + h_data.view(-1, 1) * aspc
             + torch.arange(win * aspc, device=video.device).view(1, -1)
         )
 
@@ -393,8 +290,9 @@ class RollingWAM(WAM):
 
         latent_idx = (
             1
-            + h.to(device=dev_latents.device).view(-1, 1) * nfpb
             + torch.arange(win * nfpb, device=dev_latents.device).view(1, -1)
+        ).expand(
+            batch_size, -1
         )
         dev_window_latents = torch.gather(
             dev_latents,
@@ -429,37 +327,18 @@ class RollingWAM(WAM):
         if not isinstance(video, torch.Tensor) or video.ndim < 1:
             raise ValueError("`sample['video']` must be a batched tensor.")
         batch_size = int(video.shape[0])
-        H, W = self.num_context_chunks, self.window_blocks
+        W = self.window_blocks
         if self.dit.training:
-            h_cpu, init_cpu = self._sample_training_layouts(batch_size)
+            init_cpu = self._sample_init_schedule(batch_size)
         else:
             # deterministic val: steady layout at the slide-start state (t = 1)
-            h_cpu = torch.full((batch_size,), H, dtype=torch.long)
             init_cpu = torch.zeros(batch_size, dtype=torch.bool)
 
         sample, dev = self._apply_obs_offset(
             sample,
-            h=h_cpu,
             tiled=tiled,
             allow_offset=~init_cpu,
         )
-
-        if sample.get("proprio", None) is not None:
-            proprio = sample["proprio"]
-            aspc = self.actions_per_chunk
-            proprio_idx = h_cpu.to(proprio.device) * aspc
-            max_proprio_idx = int(proprio_idx.max().item())
-            if max_proprio_idx >= proprio.shape[1]:
-                raise ValueError(
-                    f"proprio has {proprio.shape[1]} steps; window start index "
-                    f"{max_proprio_idx} is out of range"
-                )
-            sample = dict(sample)
-            sample["proprio"] = torch.gather(
-                proprio,
-                1,
-                proprio_idx.view(-1, 1, 1).expand(-1, 1, proprio.shape[2]),
-            )
 
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -472,14 +351,14 @@ class RollingWAM(WAM):
         batch_size, _, latent_t = input_latents.shape[:3]
         nfpb = self.chunk_latents
         total_chunks = (latent_t - 1) // nfpb
-        if (latent_t - 1) % nfpb != 0 or total_chunks != H + W:
+        if (latent_t - 1) % nfpb != 0 or total_chunks != W:
             raise ValueError(
-                f"RollingWAM expects 1 + (W+H)*chunk_latents = {1 + (H + W) * nfpb} latent frames "
-                f"(W={W}, H={H}, chunk_latents={nfpb}), got {latent_t}. Set data num_frames accordingly."
+                f"RollingWAM expects 1 + W*chunk_latents = {1 + W * nfpb} latent frames "
+                f"(W={W}, chunk_latents={nfpb}), got {latent_t}. Set data num_frames accordingly."
             )
         if action.shape[1] % total_chunks != 0:
             raise ValueError(
-                f"Action horizon ({action.shape[1]}) must be divisible by W+H chunks ({total_chunks})."
+                f"Action horizon ({action.shape[1]}) must be divisible by W chunks ({total_chunks})."
             )
         aspc = action.shape[1] // total_chunks
         if aspc != self.actions_per_chunk:
@@ -489,9 +368,7 @@ class RollingWAM(WAM):
             )
 
         device, dtype = input_latents.device, input_latents.dtype
-        h = h_cpu.to(device=device)
         init = init_cpu.to(device=device)
-        has_structural_padding = bool((h_cpu < H).any().item())
         n_steps = float(self.train_video_scheduler.num_train_timesteps)
 
         if self.dit.training:
@@ -506,15 +383,7 @@ class RollingWAM(WAM):
         sigma_chunk = sch._phi(u_chunk, sch.shift)
         t_window_chunk = sigma_chunk * n_steps
 
-        window_latent_idx = (
-            1
-            + h.view(-1, 1) * nfpb
-            + torch.arange(W * nfpb, device=device).view(1, -1)
-        )
-        latent_gather_idx = window_latent_idx.view(batch_size, 1, -1, 1, 1).expand(
-            -1, input_latents.shape[1], -1, input_latents.shape[3], input_latents.shape[4]
-        )
-        window_latents = torch.gather(input_latents, 2, latent_gather_idx)
+        window_latents = input_latents[:, :, 1:]
 
         base_window_latents = window_latents
         if dev is not None:
@@ -532,37 +401,20 @@ class RollingWAM(WAM):
         )
         target_video = noise_video - window_latents
 
-        latent_position = torch.arange(latent_t, device=device).view(1, -1)
-        active_latent_len = 1 + (h + W) * nfpb
-        padded_latents = input_latents
-        if has_structural_padding:
-            active_latent = latent_position < active_latent_len.view(-1, 1)
-            padded_latents = torch.where(
-                active_latent.view(batch_size, 1, latent_t, 1, 1),
-                input_latents,
-                torch.randn_like(input_latents),
-            )
-        noisy_latents = padded_latents.scatter(2, latent_gather_idx, noisy_window_latents)
+        noisy_latents = torch.cat(
+            [input_latents[:, :, :1], noisy_window_latents],
+            dim=2,
+        )
+        timestep_video = torch.cat(
+            [
+                torch.zeros((batch_size, 1), dtype=torch.float32, device=device),
+                t_window_frame,
+            ],
+            dim=1,
+        )
 
-        context_latent_len = 1 + h * nfpb
-        timestep_video = torch.full(
-            (batch_size, latent_t), n_steps, dtype=torch.float32, device=device
-        )
-        timestep_video = torch.where(
-            latent_position < context_latent_len.view(-1, 1),
-            torch.zeros_like(timestep_video),
-            timestep_video,
-        ).scatter(1, window_latent_idx, t_window_frame)
-
-        window_action_idx = (
-            h.view(-1, 1) * aspc
-            + torch.arange(W * aspc, device=device).view(1, -1)
-        )
-        action_gather_idx = window_action_idx.unsqueeze(-1).expand(-1, -1, action.shape[2])
-        window_action = torch.gather(action, 1, action_gather_idx)
-        window_action_is_pad = (
-            None if action_is_pad is None else torch.gather(action_is_pad, 1, window_action_idx)
-        )
+        window_action = action
+        window_action_is_pad = action_is_pad
 
         t_window_action = t_window_chunk.repeat_interleave(aspc, dim=1)
         base_action = window_action
@@ -594,8 +446,8 @@ class RollingWAM(WAM):
             context_mask=context_mask,
         )
 
-        attention_mask = self._build_training_attention_mask(
-            ctx_chunks=h_cpu,
+        attention_mask = self._build_rolling_attention_mask(
+            win_chunks=W,
             tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             actions_per_chunk=aspc,
             device=device,
@@ -613,7 +465,7 @@ class RollingWAM(WAM):
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        pred_w = torch.gather(pred_video, 2, latent_gather_idx)
+        pred_w = pred_video[:, :, 1:]
         video_loss_frame = torch.nn.functional.mse_loss(
             pred_w.float(), target_video.float(), reduction="none"
         ).mean(dim=(1, 3, 4))
@@ -626,9 +478,7 @@ class RollingWAM(WAM):
         if image_is_pad is not None:
             factor = int(self.vae.temporal_downsample_factor)
             latent_is_pad = image_is_pad[:, 1:].view(batch_size, -1, factor).all(dim=2)
-            window_valid = (~torch.gather(latent_is_pad, 1, window_latent_idx - 1)).to(
-                video_loss_frame.dtype
-            )
+            window_valid = (~latent_is_pad).to(video_loss_frame.dtype)
         else:
             window_valid = torch.ones_like(video_loss_frame)
         if dev is not None and dev["window_latent_is_pad"] is not None:
@@ -681,7 +531,6 @@ class RollingWAM(WAM):
         self._window_latents: Optional[torch.Tensor] = None   # [1, z, win*nfpb, h, w]
         self._window_action: Optional[torch.Tensor] = None    # [1, win*aspc, action_dim]
         self._rungs: list[int] = []
-        self._raw_frames: Optional[torch.Tensor] = None       # [1, 3, N, H, W] in [-1, 1]
         self._stream_steps: Optional[int] = None               # S locked for the episode
         self._push_count: int = 0
         self._cached_context: Optional[tuple] = None
@@ -725,16 +574,9 @@ class RollingWAM(WAM):
         return front, act
 
     @torch.no_grad()
-    def _encode_context_latents(self) -> torch.Tensor:
-        """Encode the visible clean history [anchor frame | h chunks] from the raw buffer.
-        One-shot encode matches training's VAE statistics exactly."""
-        frames = self._raw_frames.to(device=self.device, dtype=self.torch_dtype)
-        return self._encode_video_latents(frames)
-
-    @torch.no_grad()
     def _window_pass(
         self,
-        ctx_latents: torch.Tensor,
+        anchor_latent: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
         ladder_t: torch.Tensor,
@@ -746,22 +588,25 @@ class RollingWAM(WAM):
         advance: Optional[list] = None,
         video_rollout: bool = True,
     ):
-        """One denoise pass over the window against clean context; advances every rung by 1.
+        """One denoise pass over the window against the latest-observation anchor.
         `advance[j]=False` freezes chunk j (boundary init phase: clipped chunks stay pure noise).
-        `video_rollout=False` rolls actions only; the video stream is just the clean context."""
+        `video_rollout=False` rolls actions only; the video stream is just the anchor."""
         nfpb = self.chunk_latents
         win = len(self._rungs)
-        h = (ctx_latents.shape[2] - 1) // nfpb
+        if anchor_latent.shape[2] != 1:
+            raise ValueError(
+                f"`anchor_latent` must contain one latent frame, got {anchor_latent.shape[2]}."
+            )
 
         if video_rollout:
-            latents = torch.cat([ctx_latents, self._window_latents], dim=2)
+            latents = torch.cat([anchor_latent, self._window_latents], dim=2)
         else:
-            latents = ctx_latents
+            latents = anchor_latent
         rungs = torch.tensor(self._rungs, device=self.device)
         t_chunk = ladder_t[rungs].to(torch.float32)                              # [win]
         timestep_video = torch.zeros((1, latents.shape[2]), dtype=torch.float32, device=self.device)
         if video_rollout:
-            timestep_video[0, ctx_latents.shape[2]:] = t_chunk.repeat_interleave(nfpb)
+            timestep_video[0, 1:] = t_chunk.repeat_interleave(nfpb)
         t_window_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)           # [1, win*aspc]
 
         def predict(ctx, ctx_mask):
@@ -781,7 +626,6 @@ class RollingWAM(WAM):
                 context_mask=ctx_mask,
             )
             attention_mask = self._build_rolling_attention_mask(
-                ctx_chunks=h,
                 win_chunks=win,
                 tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
                 actions_per_chunk=aspc,
@@ -810,7 +654,7 @@ class RollingWAM(WAM):
             # action keeps the conditional prediction
 
         adv = [True] * win if advance is None else advance
-        pred_window = pred_video[:, :, ctx_latents.shape[2]:] if video_rollout else None
+        pred_window = pred_video[:, :, 1:] if video_rollout else None
         for j, r in enumerate(self._rungs):
             if not adv[j]:
                 continue
@@ -835,10 +679,8 @@ class RollingWAM(WAM):
         seed: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
     ) -> dict[str, Any]:
-        """One deployment step: feed the frames observed since the last call, get the next
-        action chunk. Only actions are denoised — no video is generated (world modeling is
-        a training-time objective). Returns {'action': [actions_per_chunk, action_dim],
-        'video': None}."""
+        """Condition on the latest observation and emit the next action chunk.
+        Only actions are denoised; video generation remains a training-time objective."""
         return self._rolling_act(
             new_frames=new_frames,
             prompt=prompt,
@@ -870,11 +712,17 @@ class RollingWAM(WAM):
         # recursively traversing the full module tree again on every replan.
         if self.training:
             self.eval()
-        if new_frames.ndim != 5 or new_frames.shape[0] != 1 or new_frames.shape[1] != 3:
-            raise ValueError(f"`new_frames` must be [1, 3, T, H, W], got {tuple(new_frames.shape)}")
+        if (
+            new_frames.ndim != 5
+            or new_frames.shape[0] != 1
+            or new_frames.shape[1] != 3
+            or new_frames.shape[2] != 1
+        ):
+            raise ValueError(
+                f"`new_frames` must be one latest frame [1, 3, 1, H, W], got {tuple(new_frames.shape)}"
+            )
 
-        nfpb = self.chunk_latents
-        H, W = self.num_context_chunks, self.window_blocks
+        W = self.window_blocks
         if num_inference_steps is None:
             raise ValueError("`num_inference_steps` is required (inference-only knob, not model config)")
         S = int(num_inference_steps)
@@ -885,23 +733,7 @@ class RollingWAM(WAM):
         elif S != self._stream_steps:
             raise ValueError(f"num_inference_steps changed mid-stream: {self._stream_steps} -> {S}")
         sub = S // W
-        tdf = int(self.vae.temporal_downsample_factor)
-        first_call = self._raw_frames is None
-
-        if first_call:
-            if new_frames.shape[2] != 1:
-                raise ValueError(f"First call expects a single frame, got T={new_frames.shape[2]}")
-            self._raw_frames = new_frames
-        else:
-            expected = tdf * nfpb
-            if new_frames.shape[2] != expected:
-                raise ValueError(
-                    f"Expected {expected} new frames per call (one chunk), got {new_frames.shape[2]}"
-                )
-            self._raw_frames = torch.cat([self._raw_frames, new_frames], dim=2)
-            max_frames = 1 + tdf * nfpb * H
-            if self._raw_frames.shape[2] > max_frames:
-                self._raw_frames = self._raw_frames[:, :, -max_frames:]
+        first_call = self._window_action is None
 
         if prompt is not None:
             if self._cached_context is None or self._cached_context[0] != prompt:
@@ -931,8 +763,14 @@ class RollingWAM(WAM):
                     proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
                 )
 
-        ctx_latents = self._encode_context_latents()
-        z, latent_h, latent_w = ctx_latents.shape[1], ctx_latents.shape[3], ctx_latents.shape[4]
+        anchor_latent = self._encode_video_latents(
+            new_frames.to(device=self.device, dtype=self.torch_dtype)
+        )
+        z, latent_h, latent_w = (
+            anchor_latent.shape[1],
+            anchor_latent.shape[3],
+            anchor_latent.shape[4],
+        )
         aspc = self.actions_per_chunk
         ladder_t, ladder_delta = self._rolling_ladder(S, self.device, torch.float32)
 
@@ -943,7 +781,7 @@ class RollingWAM(WAM):
                 self._push_noise_chunk(z, latent_h, latent_w, aspc, seed, video=video_rollout)
             for p in range(S):
                 self._window_pass(
-                    ctx_latents, context, context_mask, ladder_t, ladder_delta, aspc,
+                    anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
                     text_cfg_scale, negative_context, negative_context_mask,
                     advance=[p >= j * sub for j in range(W)],
                     video_rollout=video_rollout,
@@ -952,7 +790,7 @@ class RollingWAM(WAM):
             self._push_noise_chunk(z, latent_h, latent_w, aspc, seed, video=video_rollout)
             for _ in range(sub):
                 self._window_pass(
-                    ctx_latents, context, context_mask, ladder_t, ladder_delta, aspc,
+                    anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
                     text_cfg_scale, negative_context, negative_context_mask,
                     video_rollout=video_rollout,
                 )
@@ -1046,7 +884,7 @@ class RollingWAM(WAM):
 
             stream = torch.cat([anchor_latent] + emitted_video, dim=2)
             decoded = self._decode_latents_tensor(stream)
-            frames = decoded[:, :, -int(self.vae.temporal_downsample_factor) * out["video"].shape[2] :]
+            frames = decoded[:, :, -1:]
         self.rolling_reset()
 
         video_latents = torch.cat([anchor_latent] + emitted_video, dim=2)

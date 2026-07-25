@@ -17,7 +17,6 @@ class RollingWAMJoint(RollingWAM):
     @torch.no_grad()
     def _build_rolling_attention_mask(
         self,
-        ctx_chunks: int,
         win_chunks: int,
         tokens_per_frame: int,
         actions_per_chunk: int,
@@ -25,14 +24,13 @@ class RollingWAMJoint(RollingWAM):
         video_rollout: bool = True,
     ) -> torch.Tensor:
         mask = super()._build_rolling_attention_mask(
-            ctx_chunks=ctx_chunks,
             win_chunks=win_chunks,
             tokens_per_frame=tokens_per_frame,
             actions_per_chunk=actions_per_chunk,
             device=device,
             video_rollout=video_rollout,
         )
-        video_chunks = ctx_chunks + (win_chunks if video_rollout else 0)
+        video_chunks = win_chunks if video_rollout else 0
         video_seq_len = (1 + video_chunks * self.chunk_latents) * tokens_per_frame
 
         a_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)

@@ -165,10 +165,6 @@ class WorldActionRobotWinPolicy:
         self.timing_enabled = bool(timing_enabled)
 
         self.pending_actions: deque[np.ndarray] = deque()
-        # one chunk of raw sim steps; the model sees the video-rate subsample
-        self.video_stride = max(1, self.model.actions_per_chunk // (4 * self.model.chunk_latents))
-        self.frame_buffer: deque[torch.Tensor] = deque(maxlen=self.model.actions_per_chunk)
-        self._episode_started = False
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -223,22 +219,11 @@ class WorldActionRobotWinPolicy:
         return image_tensor
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
-        """Rolling replan: first call seeds the window from one frame; later calls feed the
-        frames observed while executing the previous chunk (GT-camera feedback)."""
+        """Condition the rolling window on the latest observation and emit one action chunk."""
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
-
-        if not self._episode_started:
-            new_frames = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
-            self._episode_started = True
-        else:
-            frames = list(self.frame_buffer)
-            if len(frames) < self.frame_buffer.maxlen:
-                frames = [frames[0]] * (self.frame_buffer.maxlen - len(frames)) + frames
-            # video-rate subsample of the executed chunk's raw frames, on the dataset grid
-            frames = frames[self.video_stride - 1 :: self.video_stride][-4 * self.model.chunk_latents :]
-            new_frames = torch.stack(frames, dim=2)  # [1, 3, 4*chunk_latents, H, W]
+        new_frames = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
@@ -255,7 +240,6 @@ class WorldActionRobotWinPolicy:
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
-        self.frame_buffer.clear()
         action_chunk = self._denormalize_action(pred["action"])[0]  # [aspc, D]
         return action_chunk
 
@@ -266,13 +250,9 @@ class WorldActionRobotWinPolicy:
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     def should_request_observation(self) -> bool:
-        if self.context_chunks > 0:
-            return True
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
-        if observation is not None and self._episode_started:
-            self.frame_buffer.append(self._build_robotwin_image_tensor(observation))
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -305,8 +285,6 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
-        self.frame_buffer.clear()
-        self._episode_started = False
         self.model.rolling_reset()
         self.episode_count += 1
         self.step_count = 0
