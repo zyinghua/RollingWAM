@@ -541,19 +541,20 @@ class RollingWAM(WAM):
     ):
         """Append a pure-noise chunk at the back of the window, rung 0.
         Deterministic per-push seed keeps CFG ranks and reruns identical."""
-        gen = None
+        gen_v = gen_a = None
         if seed is not None:
-            gen = torch.Generator(device="cpu").manual_seed(seed + self._push_count)
+            gen_v = torch.Generator(device="cpu").manual_seed(seed + self._push_count)
+            gen_a = torch.Generator(device="cpu").manual_seed(seed + self._push_count)
         self._push_count += 1
         if video:
-            v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen).to(
+            v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen_v).to(
                 device=self.device, dtype=self.torch_dtype
             )
             if self._window_latents is None or self._window_latents.shape[2] == 0:
                 self._window_latents = v
             else:
                 self._window_latents = torch.cat([self._window_latents, v], dim=2)
-        a = torch.randn((1, aspc, self.action_expert.action_dim), generator=gen).to(
+        a = torch.randn((1, aspc, self.action_expert.action_dim), generator=gen_a).to(
             device=self.device, dtype=self.torch_dtype
         )
         if self._window_action is None or self._window_action.shape[1] == 0:
