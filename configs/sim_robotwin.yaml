@@ -27,6 +27,7 @@ EVALUATION:
   negative_prompt: ""
   timing_enabled: false
   skip_get_obs_within_replan: false
+  save_imagined_rollouts: false  # joint variant only: save per-episode imagined video mp4s
 
   # Runtime inputs
   dataset_stats_path: null

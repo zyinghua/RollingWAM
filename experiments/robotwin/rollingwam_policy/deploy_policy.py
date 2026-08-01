@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import sys
@@ -26,6 +27,7 @@ from rollingwam.datasets.lerobot.processors.rollingwam_processor import RollingW
 from rollingwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from rollingwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from rollingwam.utils.config_resolvers import register_default_resolvers
+from rollingwam.utils.video_io import save_mp4
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,8 @@ class WorldActionRobotWinPolicy:
         text_cfg_scale: float,
         negative_prompt: str,
         timing_enabled: bool,
+        save_imagined_rollouts: bool = False,
+        imagined_dir: Optional[Path] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -168,6 +172,20 @@ class WorldActionRobotWinPolicy:
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+
+        if save_imagined_rollouts and imagined_dir is None:
+            raise ValueError(
+                "save_imagined_rollouts requires `eval_output_dir` so imagined videos "
+                "land next to the simulator recordings."
+            )
+        self.save_imagined_rollouts = bool(save_imagined_rollouts)
+        self.imagined_dir = imagined_dir
+        self._imagined_anchor: Optional[torch.Tensor] = None
+        self._imagined_latents: list[torch.Tensor] = []
+        self._imagined_episode_idx = 0
+        if self.save_imagined_rollouts:
+            self.imagined_dir.mkdir(parents=True, exist_ok=True)
+            atexit.register(self._flush_imagined_rollout)
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | chunk=%d actions | S=%d",
@@ -240,8 +258,47 @@ class WorldActionRobotWinPolicy:
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
+        if self.save_imagined_rollouts:
+            if pred["video"] is None:
+                raise ValueError(
+                    "save_imagined_rollouts requires the joint variant: the deployed model "
+                    "returned no video chunk (actions-only rollout)."
+                )
+            if self._imagined_anchor is None:
+                with torch.no_grad():
+                    self._imagined_anchor = self.model._encode_video_latents(new_frames).detach()
+            self._imagined_latents.append(pred["video"].detach().to(device="cpu"))
+
         action_chunk = self._denormalize_action(pred["action"])[0]  # [aspc, D]
         return action_chunk
+
+    def _flush_imagined_rollout(self) -> None:
+        """Decode the episode's emitted chunk latents in one pass and save the mp4.
+
+        Each frame covers several action steps (dataset temporal subsampling), so frames
+        are repeated to match the simulator recording's one-frame-per-action pacing."""
+        if not self._imagined_latents:
+            return
+
+        anchor = self._imagined_anchor
+        stream = torch.cat(
+            [anchor] + [lat.to(device=anchor.device) for lat in self._imagined_latents],
+            dim=2,
+        )
+        with torch.no_grad():
+            frames = self.model._decode_latents(stream)
+
+        frames_per_chunk = int(self.model.vae.temporal_downsample_factor) * int(self.model.chunk_latents)
+        repeat = max(1, self.model.actions_per_chunk // frames_per_chunk)
+        paced_frames = [frame for frame in frames for _ in range(repeat)]
+
+        video_path = self.imagined_dir / f"episode{self._imagined_episode_idx}.mp4"
+        save_mp4(paced_frames, str(video_path), fps=10)
+        logger.info("Saved imagined rollout | %s | chunks=%d", video_path, len(self._imagined_latents))
+
+        self._imagined_episode_idx += 1
+        self._imagined_anchor = None
+        self._imagined_latents = []
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
@@ -285,6 +342,8 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        if self.save_imagined_rollouts:
+            self._flush_imagined_rollout()
         self.model.rolling_reset()
         self.episode_count += 1
         self.step_count = 0
@@ -331,6 +390,16 @@ def get_model(usr_args: Dict[str, Any]):
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
 
+    save_imagined_rollouts = _parse_bool(
+        usr_args.get("save_imagined_rollouts", cfg.EVALUATION.get("save_imagined_rollouts", False))
+    )
+    imagined_dir: Optional[Path] = None
+    if save_imagined_rollouts:
+        eval_output_dir = usr_args.get("eval_output_dir")
+        if _is_none_like(eval_output_dir):
+            raise ValueError("save_imagined_rollouts requires `eval_output_dir` to be set.")
+        imagined_dir = Path(str(eval_output_dir)).expanduser() / "imagined_rollouts"
+
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
         processor_cfg=cfg.data.train.processor,
@@ -343,6 +412,8 @@ def get_model(usr_args: Dict[str, Any]):
         text_cfg_scale=text_cfg_scale,
         negative_prompt=negative_prompt,
         timing_enabled=timing_enabled,
+        save_imagined_rollouts=save_imagined_rollouts,
+        imagined_dir=imagined_dir,
     )
     return policy
 

@@ -219,6 +219,11 @@ def main(cfg: DictConfig):
         "skip_get_obs_within_replan",
         cfg.EVALUATION.skip_get_obs_within_replan,
     )
+    _append_override(
+        overrides,
+        "save_imagined_rollouts",
+        cfg.EVALUATION.save_imagined_rollouts,
+    )
 
     cmd = [
         sys.executable,
