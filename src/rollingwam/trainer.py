@@ -672,8 +672,9 @@ class Wan22Trainer:
                     missing = sorted(set(current_rolling) - set(saved_rolling))
                     if missing:
                         logger.warning(
-                            "State file rolling config predates %s; keeping the current values.",
+                            "State file rolling config predates %s; adopting the current values: %s",
                             missing,
+                            {k: current_rolling[k] for k in missing},
                         )
                         saved_rolling = {**{k: current_rolling[k] for k in missing}, **saved_rolling}
                     if saved_rolling != current_rolling:
