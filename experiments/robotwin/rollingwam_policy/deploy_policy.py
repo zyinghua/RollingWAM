@@ -259,11 +259,6 @@ class WorldActionRobotWinPolicy:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
         if self.save_imagined_rollouts:
-            if pred["video"] is None:
-                raise ValueError(
-                    "save_imagined_rollouts requires the joint variant: the deployed model "
-                    "returned no video chunk (actions-only rollout)."
-                )
             if self._imagined_anchor is None:
                 with torch.no_grad():
                     self._imagined_anchor = self.model._encode_video_latents(new_frames).detach()

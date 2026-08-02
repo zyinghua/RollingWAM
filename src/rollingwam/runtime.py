@@ -158,8 +158,7 @@ def create_wam(
     )
 
 
-def _create_rollingwam_impl(
-    model_cls,
+def create_rollingwam(
     model_id: str,
     tokenizer_model_id: str,
     video_dit_config,
@@ -225,7 +224,9 @@ def _create_rollingwam_impl(
     if not isinstance(rolling, dict):
         raise ValueError(f"`rolling` must be dict-like, got {type(rolling)}")
 
-    return model_cls.from_wan22_pretrained(
+    from .models.wan22.rollingwam import RollingWAM
+
+    return RollingWAM.from_wan22_pretrained(
         rolling=rolling,
         device=device,
         torch_dtype=model_dtype,
@@ -249,20 +250,6 @@ def _create_rollingwam_impl(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
     )
-
-
-
-def create_rollingwam(**kwargs):
-    from .models.wan22.rollingwam import RollingWAM
-
-    return _create_rollingwam_impl(RollingWAM, **kwargs)
-
-
-def create_rollingwam_joint(**kwargs):
-    from .models.wan22.rollingwam_joint import RollingWAMJoint
-
-    return _create_rollingwam_impl(RollingWAMJoint, **kwargs)
-
 
 
 def build_datasets(data_cfg: DictConfig):
