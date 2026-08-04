@@ -26,6 +26,7 @@ train:
   selected_task_data_mode: ${data.selected_task_data_mode}
   task_text_embedding_cache_root: ${data.text_embedding_cache_root}
   expected_episodes_per_task: ${data.expected_episodes_per_task}
+  val_set_proportion: 0.0
   dataset_dirs:
     - ${data.dataset_root}
   # Compute normalization statistics from the selected tasks on the first run.
