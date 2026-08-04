@@ -7,8 +7,8 @@
 # batch_size / grad_accum fall back to the task yaml defaults when omitted.
 # Examples (aspc x W -> args):
 #   16x5: bash scripts/robotwin/train_window_ablation_8gpu.sh 5 1 10
-#   16x7: bash scripts/robotwin/train_window_ablation_8gpu.sh 7 1 14 2 4
-#   32x3: bash scripts/robotwin/train_window_ablation_8gpu.sh 3 2 12 2 4
+#   16x7: bash scripts/robotwin/train_window_ablation_8gpu.sh 7 1 14 4 4
+#   32x3: bash scripts/robotwin/train_window_ablation_8gpu.sh 3 2 12 4 4
 
 set -euo pipefail
 
