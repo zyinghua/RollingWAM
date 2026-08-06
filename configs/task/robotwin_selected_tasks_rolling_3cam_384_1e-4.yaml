@@ -17,11 +17,9 @@ data:
     # raw steps for the model window: ratio * 4 (VAE temporal factor) * chunk_latents * W + 1
     num_frames: ${eval:'${data.train.action_video_freq_ratio} * 4 * ${model.rolling.chunk_latents} * ${model.rolling.window_blocks} + 1'}
     obs_offset_margin: ${eval:'${model.rolling.obs_offset_range} if ${model.rolling.obs_offset_prob} > 0 else 0'}
-    skip_padding_as_possible: true
   val:
     num_frames: ${data.train.num_frames}
     obs_offset_margin: ${data.train.obs_offset_margin}
-    skip_padding_as_possible: true
 
 # scheduler
 lr_scheduler_type: "cosine"
