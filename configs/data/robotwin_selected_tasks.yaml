@@ -19,6 +19,9 @@ selected_task_names:
   - lift_pot
   - beat_block_hammer
   - put_object_cabinet
+  - handover_mic
+  - stack_bowls_two
+  - move_can_pot
 text_embedding_cache_root: /datasets/robotwin2.0-fastwam/text_embeds_cache
 
 train:
