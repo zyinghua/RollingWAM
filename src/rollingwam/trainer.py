@@ -415,21 +415,6 @@ class Wan22Trainer:
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
 
-        # crop the obs-offset margin so the rollout matches the trained window
-        margin = int(getattr(model, "obs_offset_range", 0))
-        if margin > 0:
-            sample = dict(sample)
-            n_frames_all = sample["video"].shape[2]
-            sample["video"] = sample["video"][:, :, margin:-margin]
-            if sample.get("image_is_pad", None) is not None:
-                sample["image_is_pad"] = sample["image_is_pad"][:, margin:-margin]
-            for key in ("action", "action_is_pad", "proprio"):
-                if sample.get(key, None) is not None:
-                    apt = sample[key].shape[1] // (n_frames_all - 1)
-                    sample[key] = sample[key][:, margin * apt : -(margin * apt)]
-            if sample.get("action", None) is not None:
-                sample["action_horizon"] = int(sample["action"].shape[1])
-
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None

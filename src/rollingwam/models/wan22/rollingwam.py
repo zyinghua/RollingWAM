@@ -23,8 +23,6 @@ class RollingWAM(WAM):
         actions_per_chunk: int = 16,
         init_schedule_prob: float = 0.0,
         random_schedule_prob: float = 0.0,
-        obs_offset_prob: float = 0.0,
-        obs_offset_range: int = 0,
     ):
         for a, b in (
             (self.train_video_scheduler, self.train_action_scheduler),
@@ -48,20 +46,12 @@ class RollingWAM(WAM):
             raise ValueError(f"`init_schedule_prob` must be in [0, 1], got {init_schedule_prob}")
         if not 0.0 <= random_schedule_prob <= 1.0:
             raise ValueError(f"`random_schedule_prob` must be in [0, 1], got {random_schedule_prob}")
-        if not 0.0 <= obs_offset_prob <= 1.0:
-            raise ValueError(f"`obs_offset_prob` must be in [0, 1], got {obs_offset_prob}")
-        if obs_offset_range < 0:
-            raise ValueError(f"`obs_offset_range` must be >= 0, got {obs_offset_range}")
-        if obs_offset_prob > 0 and obs_offset_range == 0:
-            raise ValueError("`obs_offset_prob` > 0 requires `obs_offset_range` >= 1")
 
         self.window_blocks = int(window_blocks)
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
         self.init_schedule_prob = float(init_schedule_prob)
         self.random_schedule_prob = float(random_schedule_prob)
-        self.obs_offset_prob = float(obs_offset_prob)
-        self.obs_offset_range = int(obs_offset_range) if obs_offset_prob > 0 else 0
         self.rolling_reset()
         return self
 
@@ -82,7 +72,7 @@ class RollingWAM(WAM):
 
     ROLLING_KEYS = (
         "window_blocks", "chunk_latents", "actions_per_chunk",
-        "init_schedule_prob", "random_schedule_prob", "obs_offset_prob", "obs_offset_range",
+        "init_schedule_prob", "random_schedule_prob",
     )
 
     def get_rolling_config(self) -> dict[str, Any]:
@@ -201,126 +191,6 @@ class RollingWAM(WAM):
             return torch.zeros(batch_size, dtype=torch.bool)
         return torch.rand((batch_size,)) < self.random_schedule_prob
 
-    def _apply_obs_offset(
-        self,
-        sample: dict,
-        tiled: bool,
-        allow_offset: torch.Tensor,
-    ):
-        """Execution-deviation augmentation. The data carries `obs_offset_range` extra video
-        frames of margin on each side; the center crop is the GT clip and supplies
-        conditioning, context, and supervision. With probability `obs_offset_prob`, the
-        window's noising base is instead taken from a clip shifted by a per-sample offset
-        in [-range, range] video frames, so the model learns to steer window content toward
-        what the latest observation says. Returns (sample sliced to the GT clip, dev|None)."""
-        m = self.obs_offset_range
-        if m == 0:
-            return sample, None
-
-        video, action = sample["video"], sample["action"]
-        batch_size = video.shape[0]
-        if allow_offset.shape != (batch_size,):
-            raise ValueError("`allow_offset` must be a 1D tensor matching the batch size.")
-        nfpb, aspc = self.chunk_latents, self.actions_per_chunk
-        win = self.window_blocks
-        tdf = int(self.vae.temporal_downsample_factor)
-        frames = 1 + tdf * nfpb * win
-        if video.shape[2] != frames + 2 * m:
-            raise ValueError(
-                f"obs_offset_range={m} expects {frames + 2 * m} video frames "
-                f"({frames} + 2*{m} margin), got {video.shape[2]}. Set data num_frames accordingly."
-            )
-        if action.shape[1] % (video.shape[2] - 1) != 0:
-            raise ValueError(
-                f"Action horizon ({action.shape[1]}) must be divisible by video transitions ({video.shape[2] - 1})."
-            )
-        apt = action.shape[1] // (video.shape[2] - 1)
-        if apt * tdf * nfpb != aspc:
-            raise ValueError(
-                f"Data supplies {apt * tdf * nfpb} actions per chunk but `actions_per_chunk={aspc}`."
-            )
-
-        image_is_pad = sample.get("image_is_pad", None)
-        action_is_pad = sample.get("action_is_pad", None)
-        sample = dict(sample)
-        sample["video"] = video[:, :, m : m + frames]
-        sample["action"] = action[:, m * apt : (m + frames - 1) * apt]
-        if image_is_pad is not None:
-            sample["image_is_pad"] = image_is_pad[:, m : m + frames]
-        if action_is_pad is not None:
-            sample["action_is_pad"] = action_is_pad[:, m * apt : (m + frames - 1) * apt]
-        if sample.get("proprio", None) is not None:
-            sample["proprio"] = sample["proprio"][:, m * apt : (m + frames - 1) * apt]
-
-        if not self.dit.training or self.obs_offset_prob <= 0:
-            return sample, None
-
-        active = allow_offset.to(device=video.device, dtype=torch.bool)
-        active &= torch.rand(batch_size, device=video.device) < self.obs_offset_prob
-        if not active.any().item():
-            return sample, None
-
-        # never shift into padded future: pads are a contiguous episode tail, so cap the
-        # positive offsets per sample at the last fully valid deviated clip
-        o_hi = torch.full((batch_size,), m, dtype=torch.long, device=video.device)
-        if image_is_pad is not None:
-            o_hi = torch.minimum(o_hi, (~image_is_pad).sum(dim=1) - (m + frames))
-        if action_is_pad is not None:
-            o_hi = torch.minimum(o_hi, (~action_is_pad).sum(dim=1) // apt - (m + frames - 1))
-        o_hi = o_hi.clamp(min=-m)
-
-        width = (o_hi + m + 1).to(torch.float32)
-        offset = (torch.rand(batch_size, device=video.device) * width).long() - m
-        offset = torch.where(active, offset, torch.zeros_like(offset))
-        f_idx = m + offset.view(-1, 1) + torch.arange(frames, device=video.device).view(1, -1)
-        a_idx = (
-            (m + offset).view(-1, 1) * apt
-            + torch.arange(win * aspc, device=video.device).view(1, -1)
-        )
-
-        dev_video = torch.gather(
-            video, 2,
-            f_idx.view(batch_size, 1, frames, 1, 1).expand(-1, video.shape[1], -1, video.shape[3], video.shape[4]),
-        )
-        dev_latents = self._encode_video_latents(
-            dev_video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True), tiled=tiled
-        )
-        dev_action = torch.gather(action, 1, a_idx.unsqueeze(-1).expand(-1, -1, action.shape[2]))
-
-        latent_idx = (
-            1
-            + torch.arange(win * nfpb, device=dev_latents.device).view(1, -1)
-        ).expand(
-            batch_size, -1
-        )
-        dev_window_latents = torch.gather(
-            dev_latents,
-            2,
-            latent_idx.view(batch_size, 1, -1, 1, 1).expand(
-                -1, dev_latents.shape[1], -1, dev_latents.shape[3], dev_latents.shape[4]
-            ),
-        )
-
-        dev_latent_is_pad = dev_action_is_pad = None
-        if image_is_pad is not None:
-            dev_frame_is_pad = torch.gather(image_is_pad, 1, f_idx)
-            dev_all_latent_is_pad = dev_frame_is_pad[:, 1:].view(batch_size, -1, tdf).all(dim=2)
-            dev_latent_is_pad = torch.gather(
-                dev_all_latent_is_pad,
-                1,
-                (latent_idx - 1).to(dev_all_latent_is_pad.device),
-            ).to(self.device)
-        if action_is_pad is not None:
-            dev_action_is_pad = torch.gather(action_is_pad, 1, a_idx).to(self.device)
-
-        return sample, {
-            "active": active.to(self.device),
-            "window_latents": dev_window_latents,
-            "window_action": dev_action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
-            "window_latent_is_pad": dev_latent_is_pad,
-            "window_action_is_pad": dev_action_is_pad,
-        }
-
     def training_loss(self, sample, tiled: bool = False):
         video = sample.get("video")
         if not isinstance(video, torch.Tensor) or video.ndim < 1:
@@ -334,12 +204,6 @@ class RollingWAM(WAM):
             # deterministic val: steady layout at the slide-start state (t = 1)
             init_cpu = torch.zeros(batch_size, dtype=torch.bool)
             random_cpu = torch.zeros(batch_size, dtype=torch.bool)
-
-        sample, dev = self._apply_obs_offset(
-            sample,
-            tiled=tiled,
-            allow_offset=~(init_cpu | random_cpu),
-        )
 
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -389,19 +253,11 @@ class RollingWAM(WAM):
 
         window_latents = input_latents[:, :, 1:]
 
-        base_window_latents = window_latents
-        if dev is not None:
-            base_window_latents = torch.where(
-                dev["active"].view(batch_size, 1, 1, 1, 1),
-                dev["window_latents"],
-                window_latents,
-            )
-
         noise_video = torch.randn_like(window_latents)
         t_window_frame = t_window_chunk.repeat_interleave(nfpb, dim=1)
         sigma_video = (t_window_frame / n_steps).to(dtype).view(batch_size, 1, -1, 1, 1)
         noisy_window_latents = (
-            (1 - sigma_video) * base_window_latents + sigma_video * noise_video
+            (1 - sigma_video) * window_latents + sigma_video * noise_video
         )
         target_video = noise_video - window_latents
 
@@ -421,16 +277,9 @@ class RollingWAM(WAM):
         window_action_is_pad = action_is_pad
 
         t_window_action = t_window_chunk.repeat_interleave(aspc, dim=1)
-        base_action = window_action
-        if dev is not None:
-            base_action = torch.where(
-                dev["active"].view(batch_size, 1, 1),
-                dev["window_action"],
-                window_action,
-            )
         noise_action = torch.randn_like(window_action)
         sigma_action = (t_window_action / n_steps).to(dtype).unsqueeze(-1)
-        noisy_window_action = (1 - sigma_action) * base_action + sigma_action * noise_action
+        noisy_window_action = (1 - sigma_action) * window_action + sigma_action * noise_action
         target_action = noise_action - window_action
 
         action_tokens = noisy_window_action
@@ -485,8 +334,6 @@ class RollingWAM(WAM):
             window_valid = (~latent_is_pad).to(video_loss_frame.dtype)
         else:
             window_valid = torch.ones_like(video_loss_frame)
-        if dev is not None and dev["window_latent_is_pad"] is not None:
-            window_valid = window_valid * (~dev["window_latent_is_pad"]).to(window_valid.dtype)
         valid_sum = window_valid.sum(dim=1).clamp(min=1.0)
         schedule_active = (~init.view(-1, 1)) | (u_chunk < 1.0)
         video_loss_mask = window_valid * schedule_active.repeat_interleave(
@@ -510,8 +357,6 @@ class RollingWAM(WAM):
             action_valid = (~window_action_is_pad).to(action_loss_token.dtype)
         else:
             action_valid = torch.ones_like(action_loss_token)
-        if dev is not None and dev["window_action_is_pad"] is not None:
-            action_valid = action_valid * (~dev["window_action_is_pad"]).to(action_valid.dtype)
         valid_sum = action_valid.sum(dim=1).clamp(min=1.0)
         action_loss_mask = action_valid * schedule_active.repeat_interleave(
             aspc, dim=1
