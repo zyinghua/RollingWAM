@@ -20,7 +20,7 @@ selected_task_names:
   - beat_block_hammer
   - put_object_cabinet
   - stack_bowls_two
-  - blocks_ranking_rgb
+  - blocks_ranking_size
   - stack_blocks_three
 text_embedding_cache_root: /datasets/robotwin2.0-fastwam/text_embeds_cache
 
