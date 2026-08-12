@@ -38,7 +38,7 @@ wandb:
   project: rolling-wam
   name: train
   group: null
-  mode: online
+  mode: offline
 
 hydra:
   job:
