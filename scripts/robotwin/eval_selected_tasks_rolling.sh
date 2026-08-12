@@ -34,7 +34,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-for task_name in beat_block_hammer lift_pot put_object_cabinet; do
+for task_name in beat_block_hammer lift_pot put_object_cabinet handover_mic stack_bowls_two move_can_pot; do
   DIFFSYNTH_MODEL_BASE_PATH=/workspace/RollingWAM/checkpoints \
   DIFFSYNTH_SKIP_DOWNLOAD=true \
   python experiments/robotwin/eval_robotwin_single.py \
