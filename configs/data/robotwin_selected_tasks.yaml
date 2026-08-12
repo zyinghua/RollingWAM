@@ -16,12 +16,12 @@ dataset_root: /datasets/robotwin2.0-fastwam/robotwin2.0
 # This list is the only task selection to edit. The cache path for each task is
 # derived automatically as: ${data.text_embedding_cache_root}/<task_name>.
 selected_task_names:
-  - lift_pot
+  - place_dual_shoes
   - beat_block_hammer
   - put_object_cabinet
-  - handover_mic
   - stack_bowls_two
-  - move_can_pot
+  - blocks_ranking_rgb
+  - stack_blocks_three
 text_embedding_cache_root: /datasets/robotwin2.0-fastwam/text_embeds_cache
 
 train:
