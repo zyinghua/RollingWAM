@@ -107,9 +107,20 @@ fi
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 
+MULTINODE_ARGS=()
+if (( NUM_MACHINES > 1 )); then
+  MULTINODE_ARGS=(
+    --num_machines "${NUM_MACHINES}"
+    --machine_rank "${MACHINE_RANK}"
+    --main_process_ip "${MAIN_PROCESS_IP}"
+    --main_process_port "${MAIN_PROCESS_PORT}"
+  )
+fi
+
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero2_ds.yaml \
-  --num_processes "${NPROC_PER_NODE}" \
+  --num_processes "$((NPROC_PER_NODE * NUM_MACHINES))" \
+  "${MULTINODE_ARGS[@]}" \
   scripts/train.py \
   "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
   "wandb.name=${TASK_BASENAME}" \
