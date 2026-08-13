@@ -34,6 +34,13 @@ RUN pip install --no-build-isolation \
 RUN pip install --no-build-isolation \
         "git+https://github.com/NVlabs/curobo.git@${CUROBO_REF}"
 
+COPY pyproject.toml /tmp/rollingwam-pyproject.toml
+RUN pip install tomli \
+    && python3 -c "import tomli; print(chr(10).join(tomli.load(open('/tmp/rollingwam-pyproject.toml','rb'))['project']['dependencies']))" > /tmp/rollingwam-requirements.txt \
+    && pip install --extra-index-url https://download.pytorch.org/whl/cu128 -r /tmp/rollingwam-requirements.txt \
+    && rm /tmp/rollingwam-pyproject.toml /tmp/rollingwam-requirements.txt
+
 WORKDIR /workspace
 
+ENTRYPOINT ["/workspace/RollingWAM/docker/entrypoint.sh"]
 CMD ["bash"]
