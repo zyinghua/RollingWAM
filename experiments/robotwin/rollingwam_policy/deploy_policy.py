@@ -173,6 +173,8 @@ class WorldActionRobotWinPolicy:
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
         self._replan_times: list[float] = []
+        if self.timing_enabled:
+            atexit.register(self._log_replan_timing)
 
         if save_imagined_rollouts and imagined_dir is None:
             raise ValueError(
@@ -257,8 +259,9 @@ class WorldActionRobotWinPolicy:
                 num_inference_steps=self.num_inference_steps,
             )
         if self.timing_enabled:
-            self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
-            self._replan_times.append(time.perf_counter() - infer_t0)
+            infer_elapsed = time.perf_counter() - infer_t0
+            self._timing_rollout["infer_s"] += infer_elapsed
+            self._replan_times.append(infer_elapsed)
 
         if self.save_imagined_rollouts:
             if self._imagined_anchor is None:
@@ -337,22 +340,27 @@ class WorldActionRobotWinPolicy:
             "sim_s": float(self._timing_rollout["sim_s"]),
         }
 
+    def _log_replan_timing(self) -> None:
+        """Episode summary; RoboTwin resets before each episode, so the last one flushes at exit."""
+        if not self._replan_times:
+            return
+        # the first replan runs the full init phase (S passes); steady replans run S/W
+        init_s, steady = self._replan_times[0], self._replan_times[1:]
+        logger.info(
+            "Replan timing | init %.3fs | steady mean %.3fs min %.3fs max %.3fs (n=%d)",
+            init_s,
+            sum(steady) / len(steady) if steady else float("nan"),
+            min(steady) if steady else float("nan"),
+            max(steady) if steady else float("nan"),
+            len(steady),
+        )
+        self._replan_times = []
+
     def reset(self) -> None:
         self.pending_actions.clear()
         if self.save_imagined_rollouts:
             self._flush_imagined_rollout()
-        if self.timing_enabled and self._replan_times:
-            # the first replan runs the full init phase (S passes); steady replans run S/W
-            init_s, steady = self._replan_times[0], self._replan_times[1:]
-            logger.info(
-                "Replan timing | init %.3fs | steady mean %.3fs min %.3fs max %.3fs (n=%d)",
-                init_s,
-                sum(steady) / len(steady) if steady else float("nan"),
-                min(steady) if steady else float("nan"),
-                max(steady) if steady else float("nan"),
-                len(steady),
-            )
-            self._replan_times = []
+        self._log_replan_timing()
         self.model.rolling_reset()
         self.episode_count += 1
         self.step_count = 0
