@@ -172,6 +172,7 @@ class WorldActionRobotWinPolicy:
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        self._replan_times: list[float] = []
 
         if save_imagined_rollouts and imagined_dir is None:
             raise ValueError(
@@ -257,6 +258,7 @@ class WorldActionRobotWinPolicy:
             )
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+            self._replan_times.append(time.perf_counter() - infer_t0)
 
         if self.save_imagined_rollouts:
             if self._imagined_anchor is None:
@@ -339,6 +341,18 @@ class WorldActionRobotWinPolicy:
         self.pending_actions.clear()
         if self.save_imagined_rollouts:
             self._flush_imagined_rollout()
+        if self.timing_enabled and self._replan_times:
+            # the first replan runs the full init phase (S passes); steady replans run S/W
+            init_s, steady = self._replan_times[0], self._replan_times[1:]
+            logger.info(
+                "Replan timing | init %.3fs | steady mean %.3fs min %.3fs max %.3fs (n=%d)",
+                init_s,
+                sum(steady) / len(steady) if steady else float("nan"),
+                min(steady) if steady else float("nan"),
+                max(steady) if steady else float("nan"),
+                len(steady),
+            )
+            self._replan_times = []
         self.model.rolling_reset()
         self.episode_count += 1
         self.step_count = 0
