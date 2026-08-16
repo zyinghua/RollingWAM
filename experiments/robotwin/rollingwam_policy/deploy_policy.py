@@ -30,6 +30,7 @@ from rollingwam.utils.config_resolvers import register_default_resolvers
 from rollingwam.utils.video_io import save_mp4
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 register_default_resolvers()
 
