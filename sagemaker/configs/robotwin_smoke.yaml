@@ -1,0 +1,81 @@
+# SageMaker target: cheap end-to-end smoke. Run this BEFORE any real job.
+#
+# Proves, on one node in minutes: channels mount, DiffSynth finds the Wan
+# weights, the ActionDiT checkpoint loads, the LeRobot index builds off the
+# mounted data, `accelerate launch` comes up with the DeepSpeed plugin, a step
+# runs, and a checkpoint lands in S3.
+#
+# Two deliberate choices keep it cheap:
+#   * override_instruction pins EVERY sample to one instruction, so exactly one
+#     cached embedding is needed (this instruction is verified present in the
+#     trimmed cache by the FastWAM smoke run 2026-08-18);
+#   * max_steps/save_every are tiny, so it saves and exits quickly.
+#
+# NOT yet verified end-to-end for RollingWAM — the FastWAM twin of this config
+# ran clean on 1 x ml.p5.48xlarge spot (~13 min in Training; dataset init
+# ~4 min, 4 steps, checkpoints at step 2/4 synced to S3).
+
+task: robotwin_rolling_3cam_384_1e-4
+
+instance_count: 1
+queue: cv-spot
+
+# Channel split: episode data on File (the FastFile metadata storm stalls >90
+# min — see robotwin_full.yaml), text cache on FastFile (this smoke reads
+# exactly one file from it).
+channels:
+  robotwin:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/robotwin2.0-fastwam/robotwin2.0
+    mode: File
+    distribution: FullyReplicated
+  stats:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/robotwin2.0-fastwam/dataset_stats.json
+    mode: File
+    distribution: FullyReplicated
+  text_cache:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/robotwin2.0-fastwam/text_embeds_cache_trimmed
+    mode: FastFile
+    distribution: FullyReplicated
+  pretrained:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/fastwam/checkpoints
+    mode: File
+    distribution: FullyReplicated
+
+env:
+  DIFFSYNTH_MODEL_BASE_PATH: "{channel:pretrained}"
+  DIFFSYNTH_SKIP_DOWNLOAD: "true"
+  TOKENIZERS_PARALLELISM: "false"
+  HF_HOME: "/opt/ml/hf_cache"
+  HF_DATASETS_CACHE: "/opt/ml/hf_cache/datasets"
+  TORCH_HOME: "/opt/ml/torch_cache"
+
+overrides:
+  # Same bolt-on dataset subclass the real targets use, so the smoke exercises
+  # the trimmed-cache read path too.
+  - "data.train._target_=rollingwam_sm.dataset.TrimmedTextCacheRobotVideoDataset"
+  - "data.val._target_=rollingwam_sm.dataset.TrimmedTextCacheRobotVideoDataset"
+  - "data.train.dataset_dirs=[{channel:robotwin}]"
+  - "data.val.dataset_dirs=[{channel:robotwin}]"
+  - "data.train.pretrained_norm_stats={channel:stats}/dataset_stats.json"
+  - "data.val.pretrained_norm_stats={channel:stats}/dataset_stats.json"
+  - "data.train.text_embedding_cache_dir={channel:text_cache}"
+  - "data.val.text_embedding_cache_dir={channel:text_cache}"
+  - "model.action_dit_pretrained_path={channel:pretrained}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
+  - "output_dir={checkpoint_dir}/smoke-{job}"
+  - "wandb.enabled=false"
+  # `+` because override_instruction is not a key in configs/data/robotwin.yaml
+  # (it is a RobotVideoDataset constructor arg defaulting to None).
+  - "+data.train.override_instruction=Pick the sauce can for condiments with the left arm and relocate it near the grey kitchenpot with dark circle inside"
+  - "+data.val.override_instruction=Pick the sauce can for condiments with the left arm and relocate it near the grey kitchenpot with dark circle inside"
+  # Gradient checkpointing on: the task config turns it off, which is fine at
+  # scale but wasteful of memory for a smoke.
+  - "model.mot_checkpoint_mixed_attn=true"
+  - "batch_size=1"
+  - "num_workers=4"
+  - "gradient_accumulation_steps=1"
+  - "max_steps=4"
+  - "save_every=2"
+  # eval_every > max_steps: the offline eval (rollout + PSNR/SSIM + mp4) never
+  # fires, keeping the smoke to pure train steps.
+  - "eval_every=1000"
+  - "log_every=1"

@@ -1,0 +1,102 @@
+# SageMaker target: RollingWAM selected-tasks RoboTwin — the W-ablation config
+# (configs/task/robotwin_selected_tasks_rolling_3cam_384_1e-4.yaml, 6 tasks).
+#
+# One W per job; 4 nodes x 8 GPUs = 32 ranks matches the DGX ablation plan
+# (batch_size=4 x grad_accum=1 x 32 = effective 128):
+#
+#   bash sagemaker/run_sm.sh robotwin_selected 4 w5 \
+#       model.rolling.window_blocks=5 batch_size=4 gradient_accumulation_steps=1 \
+#       eval_num_inference_steps=15
+#
+# ############################################################################
+# # PREREQUISITES — two S3 prefixes below DO NOT EXIST yet; upload both from  #
+# # the training box first.                                                   #
+# #                                                                           #
+# # 1. Per-task text-embed caches. Selected-tasks mode derives episode->task  #
+# #    membership from the per-task layout                                    #
+# #    <root>/<task_name>/<sha256>.t5_len128.wan22ti2v5b.pt and reads         #
+# #    embeddings from those same subfolders (the flat trimmed cache cannot   #
+# #    serve it). One dir per task in configs/data/robotwin_selected_tasks    #
+# #    .yaml `selected_task_names`:                                           #
+# #                                                                           #
+# #   for t in lift_pot beat_block_hammer place_dual_shoes stack_bowls_two \  #
+# #            blocks_ranking_size stack_blocks_three; do                     #
+# #     aws s3 cp --recursive /datasets/robotwin2.0-fastwam/text_embeds_cache/$t \
+# #       s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/text_embeds_cache/$t; \
+# #   done                                                                    #
+# #                                                                           #
+# # 2. Selected-task normalization stats. On the DGX these are computed from  #
+# #    the 6 selected tasks on first run; on SageMaker rank 0 would write     #
+# #    them to its HOST-LOCAL /opt/ml/checkpoints, and the val dataset on     #
+# #    every other node crashes reading a file its host never wrote. So the   #
+# #    stats ride a channel instead. Any existing 6-task run dir already has  #
+# #    the right file (byte-identical normalization to the DGX ablation):     #
+# #                                                                           #
+# #   aws s3 cp /workspace/RollingWAM/runs/robotwin_selected_tasks_rolling_3cam_384_1e-4/<run_id>/dataset_stats.json \
+# #     s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/robotwin_selected/dataset_stats.json
+# ############################################################################
+#
+# Placeholders are expanded INSIDE the container by sagemaker/entry.py:
+#   {channel:NAME}   -> /opt/ml/input/data/NAME
+#   {checkpoint_dir} -> /opt/ml/checkpoints   (SageMaker syncs it to checkpoint_s3_uri)
+#   {task}           -> the Hydra task name
+#   {job}            -> the SageMaker training job name
+
+task: robotwin_selected_tasks_rolling_3cam_384_1e-4
+
+instance_count: 4
+queue: cv-spot
+
+channels:
+  # Full dataset mirror on a File channel (see robotwin_full.yaml for the
+  # rationale). Selected-tasks mode still needs the COMPLETE meta/ (episode
+  # selection verifies the 27,500-episode layout) even though only 300 episodes
+  # are read, so the full mirror is mounted, not a subset.
+  robotwin:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/robotwin2.0-fastwam/robotwin2.0
+    mode: File
+    distribution: FullyReplicated
+  # Per-task caches (PREREQUISITE 1 above). FastFile is fine here: startup
+  # does one rglob per task dir (hundreds of files each), then per-sample reads
+  # by hash.
+  text_cache:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/text_embeds_cache
+    mode: FastFile
+    distribution: FullyReplicated
+  # Selected-task normalization stats (PREREQUISITE 2 above).
+  stats:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/robotwin_selected/dataset_stats.json
+    mode: File
+    distribution: FullyReplicated
+  pretrained:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/fastwam/checkpoints
+    mode: File
+    distribution: FullyReplicated
+
+env:
+  DIFFSYNTH_MODEL_BASE_PATH: "{channel:pretrained}"
+  DIFFSYNTH_SKIP_DOWNLOAD: "true"
+  TOKENIZERS_PARALLELISM: "false"
+  HF_HOME: "/opt/ml/hf_cache"
+  HF_DATASETS_CACHE: "/opt/ml/hf_cache/datasets"
+  TORCH_HOME: "/opt/ml/torch_cache"
+
+overrides:
+  # The subclass is optional in selected-tasks mode (the per-task index path
+  # never mkdirs), but selecting it keeps the read path uniform and accepts
+  # trimmed per-task caches too.
+  - "data.train._target_=rollingwam_sm.dataset.TrimmedTextCacheRobotVideoDataset"
+  - "data.val._target_=rollingwam_sm.dataset.TrimmedTextCacheRobotVideoDataset"
+  # robotwin_selected_tasks.yaml routes everything through these two roots
+  # (${data.dataset_root} / ${data.text_embedding_cache_root} interpolations),
+  # so two overrides remap train+val dataset dirs, the membership index, and
+  # the embed reads at once.
+  - "data.dataset_root={channel:robotwin}"
+  - "data.text_embedding_cache_root={channel:text_cache}"
+  # Precomputed 6-task stats (PREREQUISITE 2): compute-on-first-run would strand
+  # the written dataset_stats.json on rank 0's host and crash the other nodes.
+  - "data.train.pretrained_norm_stats={channel:stats}/dataset_stats.json"
+  - "data.val.pretrained_norm_stats={channel:stats}/dataset_stats.json"
+  - "model.action_dit_pretrained_path={channel:pretrained}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
+  - "output_dir={checkpoint_dir}/{task}"
+  - "wandb.name={job}"
