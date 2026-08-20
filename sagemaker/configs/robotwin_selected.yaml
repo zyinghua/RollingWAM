@@ -9,31 +9,37 @@
 #       eval_num_inference_steps=15
 #
 # ############################################################################
-# # PREREQUISITES — two S3 prefixes below DO NOT EXIST yet; upload both from  #
-# # the training box first.                                                   #
-# #                                                                           #
-# # 1. Per-task text-embed caches. Selected-tasks mode derives episode->task  #
-# #    membership from the per-task layout                                    #
-# #    <root>/<task_name>/<sha256>.t5_len128.wan22ti2v5b.pt and reads         #
-# #    embeddings from those same subfolders (the flat trimmed cache cannot   #
-# #    serve it). One dir per task in configs/data/robotwin_selected_tasks    #
-# #    .yaml `selected_task_names`:                                           #
+# # PREREQUISITE — the per-task text-embed cache prefix below DOES NOT EXIST  #
+# # on S3 yet. Selected-tasks mode derives episode->task membership from the  #
+# # per-task layout <root>/<task_name>/<sha256>.t5_len128.wan22ti2v5b.pt and  #
+# # reads embeddings from those same subfolders (the flat trimmed cache       #
+# # cannot serve it). Upload one dir per task in                              #
+# # configs/data/robotwin_selected_tasks.yaml `selected_task_names`:          #
 # #                                                                           #
 # #   for t in lift_pot beat_block_hammer place_dual_shoes stack_bowls_two \  #
 # #            blocks_ranking_size stack_blocks_three; do                     #
 # #     aws s3 cp --recursive /datasets/robotwin2.0-fastwam/text_embeds_cache/$t \
 # #       s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/text_embeds_cache/$t; \
 # #   done                                                                    #
+# ############################################################################
+#
+# ############################################################################
+# # NORMALIZATION STATS are computed on the fly from the 6 selected tasks,   #
+# # exactly as on the DGX (pretrained_norm_stats stays null).                 #
 # #                                                                           #
-# # 2. Selected-task normalization stats. On the DGX these are computed from  #
-# #    the 6 selected tasks on first run; on SageMaker rank 0 would write     #
-# #    them to its HOST-LOCAL /opt/ml/checkpoints, and the val dataset on     #
-# #    every other node crashes reading a file its host never wrote. So the   #
-# #    stats ride a channel instead. Any existing 6-task run dir already has  #
-# #    the right file (byte-identical normalization to the DGX ablation):     #
+# # ⚠️ THIS ONLY WORKS ON A SINGLE NODE. Rank 0 computes the stats and        #
+# # broadcasts them in memory for the TRAIN set, but runtime.build_datasets   #
+# # then hands the VAL set the path <output_dir>/dataset_stats.json, which    #
+# # every rank reads from its own local disk. Only algo-1 wrote that file,    #
+# # and SageMaker has no shared filesystem, so algo-2+ raise FileNotFound.    #
 # #                                                                           #
-# #   aws s3 cp /workspace/RollingWAM/runs/robotwin_selected_tasks_rolling_3cam_384_1e-4/<run_id>/dataset_stats.json \
-# #     s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/robotwin_selected/dataset_stats.json
+# # To use more than one node, either:                                        #
+# #   (a) add `~data.val` to the submit command — val then falls back to the  #
+# #       train dataset, whose stats are already in memory, so no file is     #
+# #       read (in-training eval samples from train; the 2 monitoring val     #
+# #       episodes overlap train anyway); or                                  #
+# #   (b) precompute dataset_stats.json once, upload it, mount it as a        #
+# #       `stats` channel and set data.train/val.pretrained_norm_stats.       #
 # ############################################################################
 #
 # Placeholders are expanded INSIDE the container by sagemaker/entry.py:
@@ -63,11 +69,6 @@ channels:
     s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/text_embeds_cache
     mode: FastFile
     distribution: FullyReplicated
-  # Selected-task normalization stats (PREREQUISITE 2 above).
-  stats:
-    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/robotwin_selected/dataset_stats.json
-    mode: File
-    distribution: FullyReplicated
   pretrained:
     s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/fastwam/checkpoints
     mode: File
@@ -91,12 +92,10 @@ overrides:
   # (${data.dataset_root} / ${data.text_embedding_cache_root} interpolations),
   # so two overrides remap train+val dataset dirs, the membership index, and
   # the embed reads at once.
+  # pretrained_norm_stats stays null: stats are computed from the 6 selected
+  # tasks on first run, as on the DGX. Single node only — see the header.
   - "data.dataset_root={channel:robotwin}"
   - "data.text_embedding_cache_root={channel:text_cache}"
-  # Precomputed 6-task stats (PREREQUISITE 2): compute-on-first-run would strand
-  # the written dataset_stats.json on rank 0's host and crash the other nodes.
-  - "data.train.pretrained_norm_stats={channel:stats}/dataset_stats.json"
-  - "data.val.pretrained_norm_stats={channel:stats}/dataset_stats.json"
   - "model.action_dit_pretrained_path={channel:pretrained}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
   - "output_dir={checkpoint_dir}/{task}"
   - "wandb.name={job}"

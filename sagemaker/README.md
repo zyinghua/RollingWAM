@@ -77,17 +77,21 @@ SKIP_BUILD=1 bash sagemaker/run_sm.sh robotwin_selected 4 w5 \
   full per-rank ZeRO-2 state under `checkpoints/state/step_*`, never pruned,
   all synced to S3 — set `save_every` deliberately before a long run.
 
-### Prerequisites for `robotwin_selected` (two uploads)
+### Prerequisite for `robotwin_selected`
 
-1. The per-task text-embed caches are NOT on S3 yet. Selected-tasks mode
-   derives episode→task membership from the per-task layout and reads
-   embeddings from it, so upload the six task dirs from the training box first.
-2. The 6-task `dataset_stats.json` (from any existing selected-tasks run dir):
-   compute-on-first-run writes it only to rank 0's host-local disk, which
-   crashes the other nodes — so it rides a channel instead, and reusing the
-   DGX-computed file keeps normalization byte-identical to the DGX ablation.
+The per-task text-embed caches are NOT on S3 yet. Selected-tasks mode derives
+episode→task membership from the per-task layout and reads embeddings from it,
+so upload the six task dirs from the training box first (command in the header
+of `sagemaker/configs/robotwin_selected.yaml`).
 
-Exact commands are in the header of `sagemaker/configs/robotwin_selected.yaml`.
+Normalization stats are computed on the fly from the 6 tasks, as on the DGX.
+⚠️ That works on **one node only**: rank 0 broadcasts stats in memory for the
+train set, but the val set is handed `<output_dir>/dataset_stats.json` and every
+rank reads it from its own local disk — only `algo-1` wrote it, and there is no
+shared filesystem. For multi-node, add `~data.val` to the submit command (val
+falls back to the train dataset, whose stats are already in memory), or
+precompute the stats file, upload it, and pass
+`data.train/val.pretrained_norm_stats`.
 
 ### Spot interruptions / resume
 
