@@ -17,6 +17,7 @@ Every submission names its target explicitly — nothing is ever implied.
 | `robotwin_full` | **the standard training setup — use this unless you specifically want the ablation** | `robotwin_rolling_3cam_384_1e-4` |
 | `robotwin_selected` | 6-task window-size ablation only; needs an in-repo task index (below) | `robotwin_selected_tasks_rolling_3cam_384_1e-4` |
 | `robotwin_smoke` | pre-flight check, 4 steps on the full-RoboTwin task | `robotwin_rolling_3cam_384_1e-4` |
+| `libero` | all four LIBERO suites together; needs two uploads (below) | `libero_rolling_2cam224_1e-4` |
 
 ## 0. Dry run (no AWS calls, nothing submitted)
 
@@ -109,6 +110,26 @@ train set, but the val set is handed `<output_dir>/dataset_stats.json` and every
 rank reads it from its own local disk — only `algo-1` wrote it, and there is no
 shared filesystem. For multi-node, add `~data.val` to the submit command (val
 falls back to the train dataset, whose stats are already in memory).
+
+### LIBERO
+
+```bash
+SKIP_BUILD=1 bash sagemaker/run_sm.sh libero 1 libero-run
+```
+
+`batch_size: 16 × accum 1 × 8 GPUs = 128` effective, straight from the task
+yaml. Simpler than the RoboTwin targets because `configs/data/libero_2cam.yaml`
+defines no `val:` block: `build_datasets` sets `val_ds = train_ds`, so no
+`dataset_stats.json` is ever read from disk. Normalization is computed on the
+fly and stays in memory — that holds at any node count, so no stats channel and
+no `~data.val`. There is also no per-task cache layout (LIBERO uses the flat
+one), and training imports nothing from the LIBERO simulator, so the stock
+image works — mujoco is only needed for evaluation.
+
+Two uploads first, since FastWAM mirrored no LIBERO data to S3 (exact commands
+in the header of `sagemaker/configs/libero.yaml`): the four converted suite
+datasets from `./data/libero_mujoco3.3.2`, and the text-embed cache produced by
+`scripts/libero/precompute_libero_text_embeds.sh`.
 
 ## 4. Monitor
 
