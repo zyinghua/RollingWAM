@@ -60,11 +60,16 @@ instruction, and exits. Do this before any real job.
 # Full RoboTwin, 1 node:
 SKIP_BUILD=1 bash sagemaker/run_sm.sh robotwin_full 1 full-run
 
-# Selected-tasks W-ablation: one W per job, 4 nodes = 32 GPUs,
-# batch 4 x accum 1 x 32 = effective 128 (matches the DGX plan):
+# Selected-tasks W-ablation: one W per job, 1 node = 8 GPUs. The task yaml's
+# batch 8 x accum 2 x 8 = effective 128, so only W and S need overriding:
+SKIP_BUILD=1 bash sagemaker/run_sm.sh robotwin_selected 1 w5 \
+    model.rolling.window_blocks=5 eval_num_inference_steps=15
+
+# On MORE than one node you must add ~data.val (on-the-fly stats are not
+# readable across hosts) and rescale the batch to keep effective 128:
 SKIP_BUILD=1 bash sagemaker/run_sm.sh robotwin_selected 4 w5 \
     model.rolling.window_blocks=5 batch_size=4 gradient_accumulation_steps=1 \
-    eval_num_inference_steps=15
+    eval_num_inference_steps=15 '~data.val' 
 ```
 
 - Overrides after `<NAME>` go verbatim to `scripts/train.py` and win over the

@@ -1,12 +1,16 @@
 # SageMaker target: RollingWAM selected-tasks RoboTwin — the W-ablation config
 # (configs/task/robotwin_selected_tasks_rolling_3cam_384_1e-4.yaml, 6 tasks).
 #
-# One W per job; 4 nodes x 8 GPUs = 32 ranks matches the DGX ablation plan
-# (batch_size=4 x grad_accum=1 x 32 = effective 128):
+# One W per job on ONE node (8 GPUs). The task yaml's batch_size=8 x
+# grad_accum=2 x 8 = effective 128, matching the DGX ablation, so a run only
+# needs W and its denoising-step count:
 #
-#   bash sagemaker/run_sm.sh robotwin_selected 4 w5 \
-#       model.rolling.window_blocks=5 batch_size=4 gradient_accumulation_steps=1 \
-#       eval_num_inference_steps=15
+#   bash sagemaker/run_sm.sh robotwin_selected 1 w5 \
+#       model.rolling.window_blocks=5 eval_num_inference_steps=15
+#
+# instance_count stays 1 deliberately: at 4 nodes those same yaml defaults would
+# give 8 x 2 x 32 = 512 effective, four times the DGX runs. Multi-node also
+# needs `~data.val` (see the stats note below).
 #
 # ############################################################################
 # # TASK LABELS — nothing to upload. Selected-tasks mode labels each episode  #
