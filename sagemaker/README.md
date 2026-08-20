@@ -15,17 +15,17 @@ Every submission names its target explicitly — nothing is ever implied.
 | target | when | task |
 |---|---|---|
 | `robotwin_full` | **the standard training setup — use this unless you specifically want the ablation** | `robotwin_rolling_3cam_384_1e-4` |
-| `robotwin_selected` | 6-task window-size ablation only; needs two extra uploads (below) | `robotwin_selected_tasks_rolling_3cam_384_1e-4` |
+| `robotwin_selected` | 6-task window-size ablation only; needs an in-repo task index (below) | `robotwin_selected_tasks_rolling_3cam_384_1e-4` |
 | `robotwin_smoke` | pre-flight check, 4 steps on the full-RoboTwin task | `robotwin_rolling_3cam_384_1e-4` |
 
-## 0. Offline checks (no AWS, no torch)
+## 0. Dry run (no AWS calls, nothing submitted)
 
 ```bash
-python3 sagemaker/selftest.py
+DRY_RUN=1 bash sagemaker/run_sm.sh robotwin_full 1 test
 ```
 
-Run after every change to `sagemaker/`. `DRY_RUN=1` on any submit prints the
-assembled job without submitting (and never builds).
+Assembles the channels, overrides and estimator and prints them without
+submitting. It never triggers a build. Use it after any change to `sagemaker/`.
 
 ## 1. Build + push the image (needs docker + ECR access)
 
@@ -36,6 +36,11 @@ python sagemaker/launch_sm.py --config robotwin_full --build-only
 The image is target-independent, so any `--config` builds the same one. Re-run
 only when code or dependencies change; layer caching makes incremental builds
 fast. Submitting without `SKIP_BUILD=1` also does this automatically.
+
+⚠️ **Run this once before any `SKIP_BUILD=1` submit.** FastWAM's image lives in
+a different ECR repo (`fastwam`), so `rollingwam:latest` does not exist until
+this step runs. The ECR repo itself is created automatically. A `SKIP_BUILD=1`
+submit beforehand queues, then fails at image pull.
 
 ## 2. Smoke test (1 node, ~15 min)
 
@@ -77,39 +82,33 @@ SKIP_BUILD=1 bash sagemaker/run_sm.sh robotwin_selected 4 w5 \
   full per-rank ZeRO-2 state under `checkpoints/state/step_*`, never pruned,
   all synced to S3 — set `save_every` deliberately before a long run.
 
-### Prerequisite for `robotwin_selected`
+### Prerequisite for `robotwin_selected` (one small file)
 
-The per-task text-embed caches are NOT on S3 yet. Selected-tasks mode derives
-episode→task membership from the per-task layout and reads embeddings from it,
-so upload the six task dirs from the training box first (command in the header
-of `sagemaker/configs/robotwin_selected.yaml`).
+Embeddings come from junjie's **flat trimmed cache** — the same prefix the
+full-RoboTwin targets use, no per-task upload. But selected-tasks mode labels
+each episode by intersecting its prompt hash against the set of cache filenames
+belonging to each task, so it needs a per-task *view* of that cache.
+
+Rather than uploading real per-task directories (tens of thousands of small S3
+objects, walked at startup over a FastFile mount), the labels live in the repo
+at `configs/data/robotwin_selected_tasks_text_embeds_cache_index.json`, ride
+into the image with the rest of the code, and `entry.py` rebuilds the directory
+view inside the container as symlinks into the flat mount — names only, no file
+contents, no S3 reads. Generate it once on the training box:
+
+```bash
+python3 sagemaker/tools/make_task_index.py --cache-root /datasets/robotwin2.0-fastwam/text_embeds_cache --tasks lift_pot beat_block_hammer place_dual_shoes stack_bowls_two blocks_ranking_size stack_blocks_three
+```
+
+It writes to that path by default. Re-run it whenever `selected_task_names`
+changes, then rebuild the image so the new index is baked in.
 
 Normalization stats are computed on the fly from the 6 tasks, as on the DGX.
-⚠️ That works on **one node only**: rank 0 broadcasts stats in memory for the
+That works on **one node only**: rank 0 broadcasts stats in memory for the
 train set, but the val set is handed `<output_dir>/dataset_stats.json` and every
 rank reads it from its own local disk — only `algo-1` wrote it, and there is no
 shared filesystem. For multi-node, add `~data.val` to the submit command (val
-falls back to the train dataset, whose stats are already in memory), or
-precompute the stats file, upload it, and pass
-`data.train/val.pretrained_norm_stats`.
-
-### Spot interruptions / resume
-
-SageMaker restores `/opt/ml/checkpoints` from S3 at job (re)start. The trainer
-never auto-resumes on its own, so `entry.py` scans the job's output_dir for
-`checkpoints/state/step_*` and injects `resume=<newest>` when found (full
-optimizer/scheduler/dataloader state; the `[entry] auto-resume ...` log line
-confirms it). A step dir only qualifies if it holds `trainer_state.json` AND
-one ZeRO optimizer shard per rank — this skips checkpoints truncated by an
-interruption mid-save/mid-sync, and also means resume only engages when the
-instance count matches the original run (a mismatched world size is skipped
-with a log line and training starts fresh). Disable auto-resume entirely with
-`ROLLINGWAM_SM_AUTO_RESUME=false` via `--env`.
-
-⚠️ The `<NAME>` arg becomes part of the job name, and the job name keys the S3
-checkpoint prefix — resubmitting with the SAME name reuses that prefix and
-therefore RESUMES the earlier run instead of starting fresh. Use a new name per
-independent run (e.g. `w5-r2`).
+falls back to the train dataset, whose stats are already in memory).
 
 ## 4. Monitor
 

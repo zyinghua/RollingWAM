@@ -9,37 +9,38 @@
 #       eval_num_inference_steps=15
 #
 # ############################################################################
-# # PREREQUISITE — the per-task text-embed cache prefix below DOES NOT EXIST  #
-# # on S3 yet. Selected-tasks mode derives episode->task membership from the  #
-# # per-task layout <root>/<task_name>/<sha256>.t5_len128.wan22ti2v5b.pt and  #
-# # reads embeddings from those same subfolders (the flat trimmed cache       #
-# # cannot serve it). Upload one dir per task in                              #
-# # configs/data/robotwin_selected_tasks.yaml `selected_task_names`:          #
+# # TASK LABELS — nothing to upload. Selected-tasks mode labels each episode  #
+# # by intersecting its prompt hash against the set of cache filenames        #
+# # belonging to each task, so it needs a per-task VIEW of the cache.         #
 # #                                                                           #
-# #   for t in lift_pot beat_block_hammer place_dual_shoes stack_bowls_two \  #
-# #            blocks_ranking_size stack_blocks_three; do                     #
-# #     aws s3 cp --recursive /datasets/robotwin2.0-fastwam/text_embeds_cache/$t \
-# #       s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/text_embeds_cache/$t; \
-# #   done                                                                    #
+# # Instead of per-task directories on S3 (tens of thousands of small objects #
+# # walked at startup over a FastFile mount), the labels live in the repo at  #
+# #   configs/data/robotwin_selected_tasks_text_embeds_cache_index.json       #
+# # which is baked into the image, and entry.py rebuilds the directory view   #
+# # locally as symlinks into the flat trimmed cache mount.                    #
+# #                                                                           #
+# # Regenerate it on the training box whenever `selected_task_names` changes  #
+# # (then rebuild the image so the new file is baked in):                     #
+# #                                                                           #
+# #   python3 sagemaker/tools/make_task_index.py \                            #
+# #       --cache-root /datasets/robotwin2.0-fastwam/text_embeds_cache \      #
+# #       --tasks lift_pot beat_block_hammer place_dual_shoes \               #
+# #               stack_bowls_two blocks_ranking_size stack_blocks_three      #
 # ############################################################################
 #
 # ############################################################################
-# # NORMALIZATION STATS are computed on the fly from the 6 selected tasks,   #
+# # NORMALIZATION STATS are computed on the fly from the 6 selected tasks,    #
 # # exactly as on the DGX (pretrained_norm_stats stays null).                 #
 # #                                                                           #
-# # ⚠️ THIS ONLY WORKS ON A SINGLE NODE. Rank 0 computes the stats and        #
+# # THIS ONLY WORKS ON A SINGLE NODE. Rank 0 computes the stats and           #
 # # broadcasts them in memory for the TRAIN set, but runtime.build_datasets   #
 # # then hands the VAL set the path <output_dir>/dataset_stats.json, which    #
 # # every rank reads from its own local disk. Only algo-1 wrote that file,    #
 # # and SageMaker has no shared filesystem, so algo-2+ raise FileNotFound.    #
 # #                                                                           #
-# # To use more than one node, either:                                        #
-# #   (a) add `~data.val` to the submit command — val then falls back to the  #
-# #       train dataset, whose stats are already in memory, so no file is     #
-# #       read (in-training eval samples from train; the 2 monitoring val     #
-# #       episodes overlap train anyway); or                                  #
-# #   (b) precompute dataset_stats.json once, upload it, mount it as a        #
-# #       `stats` channel and set data.train/val.pretrained_norm_stats.       #
+# # For more than one node, add `~data.val` to the submit command — val then  #
+# # falls back to the train dataset, whose stats are already in memory, so no #
+# # file is read (the 2 monitoring val episodes overlap train anyway).        #
 # ############################################################################
 #
 # Placeholders are expanded INSIDE the container by sagemaker/entry.py:
@@ -50,7 +51,7 @@
 
 task: robotwin_selected_tasks_rolling_3cam_384_1e-4
 
-instance_count: 4
+instance_count: 1
 queue: cv-spot
 
 channels:
@@ -62,11 +63,8 @@ channels:
     s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/robotwin2.0-fastwam/robotwin2.0
     mode: File
     distribution: FullyReplicated
-  # Per-task caches (PREREQUISITE 1 above). FastFile is fine here: startup
-  # does one rglob per task dir (hundreds of files each), then per-sample reads
-  # by hash.
   text_cache:
-    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/data/text_embeds_cache
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/robotwin2.0-fastwam/text_embeds_cache_trimmed
     mode: FastFile
     distribution: FullyReplicated
   pretrained:
@@ -81,6 +79,9 @@ env:
   HF_HOME: "/opt/ml/hf_cache"
   HF_DATASETS_CACHE: "/opt/ml/hf_cache/datasets"
   TORCH_HOME: "/opt/ml/torch_cache"
+  ROLLINGWAM_SM_TASK_INDEX: "configs/data/robotwin_selected_tasks_text_embeds_cache_index.json"
+  ROLLINGWAM_SM_TASK_CACHE_SRC: "{channel:text_cache}"
+  ROLLINGWAM_SM_TASK_CACHE_DST: "/opt/ml/task_cache"
 
 overrides:
   # The subclass is optional in selected-tasks mode (the per-task index path
@@ -95,7 +96,7 @@ overrides:
   # pretrained_norm_stats stays null: stats are computed from the 6 selected
   # tasks on first run, as on the DGX. Single node only — see the header.
   - "data.dataset_root={channel:robotwin}"
-  - "data.text_embedding_cache_root={channel:text_cache}"
+  - "data.text_embedding_cache_root=/opt/ml/task_cache"
   - "model.action_dit_pretrained_path={channel:pretrained}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
   - "output_dir={checkpoint_dir}/{task}"
   - "wandb.name={job}"

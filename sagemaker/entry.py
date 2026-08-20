@@ -158,6 +158,83 @@ def find_auto_resume(overrides: list[str], world_size: int) -> str | None:
     return None
 
 
+def build_task_cache_tree() -> str | None:
+    """Materialise a per-task text-embedding cache view from a FLAT cache.
+
+    Selected-tasks mode needs ``<root>/<task_name>/*.pt``: the per-task file set
+    is what labels each episode (``_select_episode_indices`` intersects an
+    episode's prompt hash against each task's filename set). A flat cache cannot
+    provide that, and uploading real per-task directories to S3 would mean tens
+    of thousands of small objects read over a FastFile mount at startup.
+
+    So the labels ride as ONE small JSON, ``{task_name: [cache_filename, ...]}``,
+    and this builds the directory view locally as symlinks into the flat mount:
+
+        /opt/ml/task_cache/<task_name>/<hash>.t5_len128.wan22ti2v5b.pt
+            -> /opt/ml/input/data/text_cache/<hash>.t5_len128.wan22ti2v5b.pt
+
+    Only names are created, never file contents — no S3 reads here. Built fresh
+    per job: this lives on the container's ephemeral disk, which is empty at
+    every start (unlike /opt/ml/checkpoints, nothing restores it), so there is
+    nothing to reconcile and a pre-existing link means something is wrong.
+    Returns the root it built, or None when the target did not ask for one.
+
+    Driven by three env vars (set from the target YAML's ``env:`` block, so the
+    ``{channel:...}`` placeholders are already expanded by the time we run):
+      ROLLINGWAM_SM_TASK_INDEX      the JSON index; a relative path is
+                                    resolved against the repo root, so the
+                                    index can simply live in the repo
+      ROLLINGWAM_SM_TASK_CACHE_SRC  the flat cache mount the symlinks point into
+      ROLLINGWAM_SM_TASK_CACHE_DST  where to build (default /opt/ml/task_cache)
+    """
+    index_path = os.environ.get(f"{sm_env.ENV_PREFIX}_TASK_INDEX")
+    if not index_path:
+        return None
+    src = os.environ.get(f"{sm_env.ENV_PREFIX}_TASK_CACHE_SRC")
+    if not src:
+        raise SystemExit(
+            f"{sm_env.ENV_PREFIX}_TASK_INDEX is set but "
+            f"{sm_env.ENV_PREFIX}_TASK_CACHE_SRC is not; it must name the flat "
+            "text-embedding cache mount the symlinks point into."
+        )
+    dst_root = Path(
+        os.environ.get(f"{sm_env.ENV_PREFIX}_TASK_CACHE_DST", "/opt/ml/task_cache")
+    )
+
+    # A relative path means "in the repo", which is baked into the image — no
+    # channel, no upload, and it versions with `selected_task_names`.
+    index_file = Path(index_path)
+    if not index_file.is_absolute():
+        index_file = Path(REPO_DIR) / index_file
+    if not index_file.is_file():
+        raise SystemExit(f"Task index not found: {index_file}")
+
+    index = json.loads(index_file.read_text())
+    if not isinstance(index, dict) or not index:
+        raise SystemExit(f"Task index {index_file} must be a non-empty JSON object.")
+
+    src_root = Path(src)
+    total = 0
+    for task_name, filenames in index.items():
+        if "/" in task_name or task_name in (".", ".."):
+            raise SystemExit(f"Illegal task name in {index_file}: {task_name!r}")
+        task_dir = dst_root / task_name
+        task_dir.mkdir(parents=True, exist_ok=True)
+        for filename in filenames:
+            if "/" in filename:
+                raise SystemExit(f"Illegal cache filename in {index_file}: {filename!r}")
+            (task_dir / filename).symlink_to(src_root / filename)
+        total += len(filenames)
+        print(f"[entry] task cache: {task_name} <- {len(filenames)} entries", flush=True)
+
+    print(
+        f"[entry] built per-task cache view at {dst_root} "
+        f"({len(index)} tasks, {total} links) -> {src_root}",
+        flush=True,
+    )
+    return str(dst_root)
+
+
 def main() -> None:
     if not sm_env.is_sagemaker():
         raise SystemExit(
@@ -183,6 +260,10 @@ def main() -> None:
     pretrained_s3 = os.environ.get(f"{sm_env.ENV_PREFIX}_PRETRAINED_S3")
     if pretrained_s3:
         sm_env.sync_from_s3(pretrained_s3, sm_env.SM_PRETRAINED_DIR)
+
+    # Selected-tasks targets ship a flat cache + a label index; build the
+    # per-task directory view the dataset expects before training starts.
+    build_task_cache_tree()
 
     sm_overrides = [
         expand(token, task=task) for token in shlex.split(hp.get("sm_overrides", ""))
