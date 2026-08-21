@@ -56,6 +56,6 @@ cd ../..
 
 echo "Installation basic environment complete!"
 echo -e "You need to:"
-echo -e "    1. \033[34m\033[1m(Important!)\033[0m Download asserts from huggingface."
+echo -e "    1. \033[34m\033[1m(Important!)\033[0m Download assets from huggingface."
 echo -e "    2. Install requirements for running baselines. (Optional)"
 echo "See INSTALLATION.md for more instructions."

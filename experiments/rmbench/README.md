@@ -14,9 +14,6 @@ cd /workspace/RollingWAM/third_party/RMBench
 bash script/_download_assets.sh
 ```
 
-The evaluation path does not require the demonstration dataset. Do not run
-RMBench's full `_install.sh`; it pins a different Torch version from RollingWAM.
-
 ## 2. Single-task evaluation
 
 Use the `task=` Hydra choice that matches the checkpoint's RollingWAM training
