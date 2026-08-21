@@ -133,7 +133,7 @@ image works — mujoco is only needed for evaluation.
 
 Two uploads first, since FastWAM mirrored no LIBERO data to S3 (exact commands
 in the header of `sagemaker/configs/libero.yaml`): the four converted suite
-datasets from `./data/libero_mujoco3.3.2`, and the text-embed cache produced by
+datasets from `/datasets/libero-fastwam/libero_mujoco3.3.2`, and the text-embed cache produced by
 `scripts/libero/precompute_libero_text_embeds.sh`.
 
 ## 4. Monitor

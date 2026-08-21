@@ -20,16 +20,16 @@
 # # FastWAM mirrored no LIBERO data to S3.                                    #
 # #                                                                           #
 # # 1. The four converted suite datasets (from HF `yuanty/LIBERO-fastwam`,    #
-# #    living at ./data/libero_mujoco3.3.2/ on the training box):             #
+# #    at /datasets/libero-fastwam on the training box):             #
 # #                                                                           #
-# #   aws s3 cp --recursive ./data/libero_mujoco3.3.2 \                       #
-# #     s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero_mujoco3.3.2
+# #   aws s3 cp --recursive /datasets/libero-fastwam/libero_mujoco3.3.2 \                       #
+# #     s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero-fastwam/libero_mujoco3.3.2
 # #                                                                           #
 # # 2. The text-embed cache, after running                                     #
 # #    scripts/libero/precompute_libero_text_embeds.sh on the training box:   #
 # #                                                                           #
-# #   aws s3 cp --recursive ./data/text_embeds_cache/libero \                 #
-# #     s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/text_embeds_cache/libero
+# #   aws s3 cp --recursive /datasets/libero-fastwam/text_embeds_cache/libero \                 #
+# #     s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero-fastwam/text_embeds_cache/libero
 # ############################################################################
 #
 # Placeholders are expanded INSIDE the container by sagemaker/entry.py:
@@ -50,13 +50,13 @@ channels:
   # mounted prefix. LIBERO is far smaller than RoboTwin, so the up-front
   # download is short.
   libero:
-    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero_mujoco3.3.2
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero-fastwam/libero_mujoco3.3.2
     mode: File
     distribution: FullyReplicated
   # Flat, hash-addressed, and small (one file per distinct instruction), so
   # File mode beats FastFile here — it is local from the first read on.
   text_cache:
-    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/text_embeds_cache/libero
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero-fastwam/text_embeds_cache/libero
     mode: File
     distribution: FullyReplicated
   # Wan2.2 / Wan2.1 / DiffSynth / ActionDiT weights — the same mirror the
