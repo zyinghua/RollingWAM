@@ -33,3 +33,5 @@ venv/
 # once downloaded. The policy/eval code itself stays in the image.
 third_party/RoboTwin/assets/
 third_party/RoboTwin/data/
+third_party/RMBench/assets/
+third_party/RMBench/data/
