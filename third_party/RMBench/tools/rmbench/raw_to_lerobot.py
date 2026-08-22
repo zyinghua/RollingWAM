@@ -43,7 +43,7 @@ Usage
     python third_party/RMBench/tools/rmbench/raw_to_lerobot.py \
         --raw-root /datasets/RMBench-data/data \
         --task put_back_block \
-        --out  /datasets/RMBench-data/lerobot/put_back_block
+        --out  /datasets/RMBench-data/rollingwam-rmbench/put_back_block
 """
 
 import argparse

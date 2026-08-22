@@ -8,7 +8,7 @@
 #
 # Environment overrides:
 #   RMBENCH_RAW_ROOT        raw data root      (default /datasets/RMBench-data/data)
-#   RMBENCH_OUT_ROOT        converted-out root (default /datasets/RMBench-data/lerobot)
+#   RMBENCH_OUT_ROOT        converted-out root (default /datasets/RMBench-data/rollingwam-rmbench)
 #   RMBENCH_CONFIG          raw config subdir  (default demo_clean; e.g. demo_clean_200)
 #   RMBENCH_EXPECT_EPISODES episodes per task  (default 50; 200 for demo_clean_200)
 
@@ -18,7 +18,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 RAW_ROOT="${RMBENCH_RAW_ROOT:-/datasets/RMBench-data/data}"
-OUT_ROOT="${RMBENCH_OUT_ROOT:-/datasets/RMBench-data/lerobot}"
+OUT_ROOT="${RMBENCH_OUT_ROOT:-/datasets/RMBench-data/rollingwam-rmbench}"
 CONFIG="${RMBENCH_CONFIG:-demo_clean}"
 EXPECT_EPISODES="${RMBENCH_EXPECT_EPISODES:-50}"
 
