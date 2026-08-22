@@ -3,7 +3,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id="TianxingChen/RMBench",
     repo_type="dataset",
-    local_dir=".",
+    local_dir="/datasets/RMBench-data",
     allow_patterns=["data/*/demo_clean/**"],
     resume_download=True,
 )

@@ -33,7 +33,7 @@ else
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MODEL_TASK="${ROLLINGWAM_TASK_CONFIG:-robotwin_selected_tasks_rolling_3cam_384_1e-4}"
+MODEL_TASK="${ROLLINGWAM_TASK_CONFIG:-rmbench_rolling_3cam_384_1e-4}"
 MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-${REPO_ROOT}/checkpoints}"
 INSTRUCTION_TYPE="${RMBENCH_INSTRUCTION_TYPE:-unseen}"
 EVAL_EPISODES="${RMBENCH_EVAL_NUM_EPISODES:-100}"

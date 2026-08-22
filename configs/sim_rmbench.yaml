@@ -2,7 +2,7 @@
 
 defaults:
   - train
-  - override /task: robotwin_rolling_3cam_384_1e-4
+  - override /task: rmbench_rolling_3cam_384_1e-4
   - _self_
 
 ckpt: null
