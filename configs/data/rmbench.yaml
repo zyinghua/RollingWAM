@@ -6,7 +6,7 @@ defaults:
 # tools/rmbench/raw_to_lerobot.py: same aloha-agilex embodiment and camera set
 # as RoboTwin, but native 240x320 videos, fps 15, and 14-dim absolute joint
 # state/action from joint_action/vector (matching the qpos deploy path).
-dataset_root: /datasets/RMBench-data/lerobot
+dataset_root: /datasets/RMBench-data/data/rollingwam-rmbench
 text_embedding_cache_dir: ${data.dataset_root}/text_embeds_cache
 dataset_dirs:
   - ${data.dataset_root}/observe_and_pickup
