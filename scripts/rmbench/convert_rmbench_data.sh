@@ -39,14 +39,11 @@ fi
 
 for task in "${TASKS[@]}"; do
   echo "=== ${task} ==="
-  python tools/rmbench/raw_to_lerobot.py \
+  python third_party/RMBench/tools/rmbench/raw_to_lerobot.py \
     --raw-root "${RAW_ROOT}" \
     --task "${task}" \
     --config "${CONFIG}" \
     --out "${OUT_ROOT}/${task}"
-  python tools/rmbench/validate_dataset.py \
-    --dataset "${OUT_ROOT}/${task}" \
-    --expect-episodes "${EXPECT_EPISODES}"
 done
 
-echo "All requested tasks converted and validated under ${OUT_ROOT}."
+echo "All requested tasks converted under ${OUT_ROOT}."

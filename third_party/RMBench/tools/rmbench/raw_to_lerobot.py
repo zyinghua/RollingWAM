@@ -40,7 +40,7 @@ from the videos.
 
 Usage
 -----
-    python tools/rmbench/raw_to_lerobot.py \
+    python third_party/RMBench/tools/rmbench/raw_to_lerobot.py \
         --raw-root /datasets/RMBench-data/data \
         --task put_back_block \
         --out  /datasets/RMBench-data/lerobot/put_back_block
@@ -298,7 +298,7 @@ def main():
     eval_reference = None
     reference_path = (
         Path(__file__).resolve().parents[2]
-        / "third_party" / "RMBench" / "description" / "task_instruction"
+        / "description" / "task_instruction"
         / f"{args.task}.json"
     )
     if reference_path.is_file():
