@@ -151,6 +151,7 @@ class WorldActionRobotWinPolicy:
         timing_enabled: bool,
         save_imagined_rollouts: bool = False,
         imagined_dir: Optional[Path] = None,
+        replan_steps: Optional[int] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -168,6 +169,27 @@ class WorldActionRobotWinPolicy:
         self.text_cfg_scale = float(text_cfg_scale)
         self.negative_prompt = str(negative_prompt)
         self.timing_enabled = bool(timing_enabled)
+
+        self.replan_steps = None if replan_steps is None else int(replan_steps)
+        if self.replan_steps is not None:
+            if int(self.model.window_blocks) != 1:
+                raise ValueError(
+                    f"replan_steps requires a window_blocks=1 checkpoint (got "
+                    f"W={self.model.window_blocks}): the rolling window advances one "
+                    "full chunk per replan, so partial execution would desynchronize "
+                    "it from the environment."
+                )
+            if not 0 < self.replan_steps <= int(self.model.actions_per_chunk):
+                raise ValueError(
+                    f"replan_steps must be in [1, {self.model.actions_per_chunk}], "
+                    f"got {self.replan_steps}."
+                )
+            if save_imagined_rollouts:
+                raise ValueError(
+                    "save_imagined_rollouts assumes full-chunk execution; consecutive "
+                    "chunks overlap in time under replan_steps, so the stitched video "
+                    "would be wrong. Disable one of the two."
+                )
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
@@ -192,11 +214,12 @@ class WorldActionRobotWinPolicy:
             atexit.register(self._flush_imagined_rollout)
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | chunk=%d actions | S=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | chunk=%d actions | S=%d | exec=%s",
             checkpoint_path,
             dataset_stats_path,
             self.model.actions_per_chunk,
             self.num_inference_steps,
+            "full" if self.replan_steps is None else self.replan_steps,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -303,7 +326,9 @@ class WorldActionRobotWinPolicy:
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
-        # rolling executes exactly one chunk per replan (GT feedback assumes it)
+        # rolling executes one full chunk per replan; replan_steps (W=1 only) truncates it
+        if self.replan_steps is not None:
+            action_chunk = action_chunk[: self.replan_steps]
         for i in range(action_chunk.shape[0]):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
@@ -407,6 +432,9 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    replan_steps = _parse_optional_int(
+        usr_args.get("replan_steps", cfg.EVALUATION.get("replan_steps"))
+    )
 
     save_imagined_rollouts = _parse_bool(
         usr_args.get("save_imagined_rollouts", cfg.EVALUATION.get("save_imagined_rollouts", False))
@@ -432,6 +460,7 @@ def get_model(usr_args: Dict[str, Any]):
         timing_enabled=timing_enabled,
         save_imagined_rollouts=save_imagined_rollouts,
         imagined_dir=imagined_dir,
+        replan_steps=replan_steps,
     )
     return policy
 
