@@ -656,12 +656,17 @@ class Wan22Trainer:
                     current_rolling = model.get_rolling_config()
                     missing = sorted(set(current_rolling) - set(saved_rolling))
                     if missing:
+                        legacy_defaults = getattr(model, "ROLLING_LEGACY_DEFAULTS", {})
+                        missing_values = {
+                            key: legacy_defaults.get(key, current_rolling[key])
+                            for key in missing
+                        }
                         logger.warning(
-                            "State file rolling config predates %s; adopting the current values: %s",
+                            "State file rolling config predates %s; adopting compatible values: %s",
                             missing,
-                            {k: current_rolling[k] for k in missing},
+                            missing_values,
                         )
-                        saved_rolling = {**{k: current_rolling[k] for k in missing}, **saved_rolling}
+                        saved_rolling = {**missing_values, **saved_rolling}
                     if saved_rolling != current_rolling:
                         raise ValueError(
                             "RollingWAM config mismatch for full training resume: "

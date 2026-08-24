@@ -21,6 +21,7 @@ class RollingWAM(WAM):
         window_blocks: int = 4,
         chunk_latents: int = 1,
         actions_per_chunk: int = 16,
+        cross_chunk_a2a_attn: bool = False,
         init_schedule_prob: float = 0.0,
         random_schedule_prob: float = 0.0,
     ):
@@ -42,6 +43,11 @@ class RollingWAM(WAM):
             raise ValueError(f"`chunk_latents` must be >= 1, got {chunk_latents}")
         if actions_per_chunk < 1:
             raise ValueError(f"`actions_per_chunk` must be >= 1, got {actions_per_chunk}")
+        if not isinstance(cross_chunk_a2a_attn, bool):
+            raise ValueError(
+                "`cross_chunk_a2a_attn` must be bool, "
+                f"got {type(cross_chunk_a2a_attn).__name__}."
+            )
         if not 0.0 <= init_schedule_prob <= 1.0:
             raise ValueError(f"`init_schedule_prob` must be in [0, 1], got {init_schedule_prob}")
         if not 0.0 <= random_schedule_prob <= 1.0:
@@ -50,6 +56,7 @@ class RollingWAM(WAM):
         self.window_blocks = int(window_blocks)
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
+        self.cross_chunk_a2a_attn = cross_chunk_a2a_attn
         self.init_schedule_prob = float(init_schedule_prob)
         self.random_schedule_prob = float(random_schedule_prob)
         self.rolling_reset()
@@ -72,8 +79,12 @@ class RollingWAM(WAM):
 
     ROLLING_KEYS = (
         "window_blocks", "chunk_latents", "actions_per_chunk",
-        "init_schedule_prob", "random_schedule_prob",
+        "cross_chunk_a2a_attn", "init_schedule_prob", "random_schedule_prob",
     )
+    ROLLING_LEGACY_DEFAULTS = {
+        # Every checkpoint written before this option existed used same-chunk A2A.
+        "cross_chunk_a2a_attn": False,
+    }
 
     def get_rolling_config(self) -> dict[str, Any]:
         return {key: getattr(self, key) for key in self.ROLLING_KEYS}
@@ -126,12 +137,16 @@ class RollingWAM(WAM):
             )
         missing = expected_keys - set(saved)
         if missing:
+            missing_values = {
+                key: self.ROLLING_LEGACY_DEFAULTS.get(key, getattr(self, key))
+                for key in missing
+            }
             logger.warning(
-                "Checkpoint rolling config predates %s; adopting the current yaml values: %s",
+                "Checkpoint rolling config predates %s; adopting compatible values: %s",
                 sorted(missing),
-                {key: getattr(self, key) for key in sorted(missing)},
+                {key: missing_values[key] for key in sorted(missing)},
             )
-            saved = {**{key: getattr(self, key) for key in missing}, **saved}
+            saved = {**missing_values, **saved}
         current = self.get_rolling_config()
         diff = {
             key: (current[key], saved[key])
@@ -174,9 +189,14 @@ class RollingWAM(WAM):
         mask = torch.zeros((total, total), dtype=torch.bool, device=device)
         mask[:video_seq_len, :video_seq_len] = True
         mask[:tokens_per_frame, tokens_per_frame:video_seq_len] = False
-        a_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)
         mask[video_seq_len:, :video_seq_len] = True
-        mask[video_seq_len:, video_seq_len:] = a_chunk.view(-1, 1) == a_chunk.view(1, -1)
+        if self.cross_chunk_a2a_attn:
+            mask[video_seq_len:, video_seq_len:] = True
+        else:
+            a_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)
+            mask[video_seq_len:, video_seq_len:] = (
+                a_chunk.view(-1, 1) == a_chunk.view(1, -1)
+            )
         return mask
 
     # ------------------------------------------------------------------ training
