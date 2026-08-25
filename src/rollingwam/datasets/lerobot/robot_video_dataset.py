@@ -50,6 +50,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         task_text_embedding_cache_root: Optional[str] = None,
         expected_episodes_per_task: Optional[int] = None,
     ):
+        self.num_frames = num_frames
+        self.action_video_freq_ratio = action_video_freq_ratio
+
+        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
+            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
+        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
+            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
+        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -63,16 +72,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             task_text_embedding_cache_root=task_text_embedding_cache_root,
             text_embedding_context_len=context_len,
             expected_episodes_per_task=expected_episodes_per_task,
+            image_sample_indices=self.video_sample_indices,
         )
-
-        self.num_frames = num_frames
-        self.action_video_freq_ratio = action_video_freq_ratio
-
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -113,6 +114,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if isinstance(processor, DictConfig):
                 processor = instantiate(processor)
             processor.num_obs_steps = num_frames
+            processor.num_image_steps = len(self.video_sample_indices)
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -168,15 +170,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = sample["image_is_pad"]
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+        expected_video_frames = len(self.video_sample_indices)
         num_cameras = 1
         if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
             T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
+        if T_video != expected_video_frames:
+            raise ValueError(
+                "Sparse image query returned an unexpected number of frames: "
+                f"expected {expected_video_frames} at dense indices {self.video_sample_indices}, "
+                f"got video shape {tuple(video.shape)}."
+            )
+        if image_is_pad.ndim != 1 or image_is_pad.shape[0] != expected_video_frames:
+            raise ValueError(
+                "Sparse image padding mask shape mismatch: "
+                f"expected ({expected_video_frames},), got {tuple(image_is_pad.shape)}."
+            )
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":

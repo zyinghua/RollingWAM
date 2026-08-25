@@ -40,9 +40,11 @@ class RollingWAMProcessor(BaseProcessor):
 
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
+        num_image_steps: Optional[int] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
+        self.num_image_steps = num_obs_steps if num_image_steps is None else int(num_image_steps)
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -187,10 +189,10 @@ class RollingWAMProcessor(BaseProcessor):
             Data: Dict[str, Any], lerobot sample in raw mcap obtained from dataset __getitem__:
                 - "action": Optional, Dict[str, torch.Tensor] -> [action_horizon, action_dim]
                 - "state": Dict[str, torch.Tensor] -> [num_obs_steps, state_dim]
-                - "images": Dict[str, torch.Tensor] -> [num_obs_steps, C, H, W]
+                - "images": Dict[str, torch.Tensor] -> [num_image_steps, C, H, W]
                 - "action_is_pad": Optional, torch.Tensor -> [action_horizon,]
                 - "state_is_pad": torch.Tensor -> [num_obs_steps,]
-                - "image_is_pad": torch.Tensor -> [num_obs_steps,]
+                - "image_is_pad": torch.Tensor -> [num_image_steps,]
                 - "idx": int, sample index
                 
         Returns:
@@ -198,7 +200,7 @@ class RollingWAMProcessor(BaseProcessor):
                 - "input_ids": torch.Tensor -> [max_image_text_tokens,]
                 - "attention_mask": torch.Tensor -> [max_image_text_tokens,]
                 - "pixel_values": torch.Tensor -> [num_input_cameras, C, H, W]
-                - "image_is_pad": torch.Tensor -> [num_obs_steps,]
+                - "image_is_pad": torch.Tensor -> [num_image_steps,]
                 - "proprio": torch.Tensor -> [num_obs_steps, proprio_dim]
                 - "state_is_pad": torch.Tensor -> [num_obs_steps,]
                 - "action": Optional, torch.Tensor -> [action_horizon, action_dim]
@@ -215,8 +217,8 @@ class RollingWAMProcessor(BaseProcessor):
         processed_images = []
         for meta in self.shape_meta["images"]:
             key, shape = meta["key"], meta["shape"]
-            image = data["images"][key]  # [num_obs_steps, C, H, W]
-            assert image.ndim == 4, f"Expected 4 dimensions (num_obs_steps, C, H, W), got shape {image.shape}"
+            image = data["images"][key]  # [num_image_steps, C, H, W]
+            assert image.ndim == 4, f"Expected 4 dimensions (num_image_steps, C, H, W), got shape {image.shape}"
             
             # Apply transforms efficiently on the merged batch
             transforms = self.train_transforms if self.is_train else self.val_transforms
@@ -224,7 +226,7 @@ class RollingWAMProcessor(BaseProcessor):
             for trans in current_transforms:
                 image = trans(image)
             
-            meta_shape = [self.num_obs_steps] + shape
+            meta_shape = [self.num_image_steps] + shape
             assert image.shape == meta_shape, \
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 

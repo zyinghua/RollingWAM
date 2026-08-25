@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import List, Literal, Dict, Optional, Any, DefaultDict
+from typing import List, Literal, Dict, Optional, Any, DefaultDict, Sequence
 
 import numpy as np
 import torch
@@ -433,6 +433,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        image_sample_indices: Optional[Sequence[int]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -458,6 +459,29 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         
         self.global_sample_stride = global_sample_stride
 
+        # Images may run at a lower cadence than robot state/action. Treat the
+        # supplied values as positions within the otherwise dense observation window.
+        dense_obs_offsets = list(
+            range(-past_obs_size, -past_obs_size + obs_size)
+        )
+        if image_sample_indices is None:
+            self.image_sample_indices = list(range(obs_size))
+        else:
+            self.image_sample_indices = [int(index) for index in image_sample_indices]
+            if not self.image_sample_indices:
+                raise ValueError("`image_sample_indices` must contain at least one index.")
+            if self.image_sample_indices != sorted(set(self.image_sample_indices)):
+                raise ValueError(
+                    "`image_sample_indices` must be strictly increasing and contain no duplicates, "
+                    f"got {self.image_sample_indices}."
+                )
+            if self.image_sample_indices[0] < 0 or self.image_sample_indices[-1] >= obs_size:
+                raise ValueError(
+                    "`image_sample_indices` entries must be within the dense observation window "
+                    f"[0, {obs_size}), got {self.image_sample_indices}."
+                )
+        image_obs_offsets = [dense_obs_offsets[index] for index in self.image_sample_indices]
+
         self.val_set_proportion = val_set_proportion
         self.is_training_set = is_training_set
 
@@ -470,14 +494,14 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps for t in image_obs_offsets
             ]
         
         for meta in self.state_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"observation.state.{key}" if key != "default" else "observation.state"
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps for t in dense_obs_offsets
             ]
         
         for meta in self.action_meta:
