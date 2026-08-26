@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Train RollingWAM on one RMBench task (RMBench's per-task evaluation protocol).
-# Defaults: constant LR, 5 epochs, batch_size 4 x grad_accum 4 x 8 GPUs = 128.
+# Defaults: constant LR, 1500 steps, batch_size 4 x grad_accum 1 x num_gpus.
 # Every default is a plain Hydra override, so trailing overrides win.
 #
 # Usage:
 #   bash scripts/rmbench/train_single_task_rolling.sh <task_name> [hydra_overrides...]
-#   bash scripts/rmbench/train_single_task_rolling.sh put_back_block num_epochs=10
+#   bash scripts/rmbench/train_single_task_rolling.sh put_back_block max_steps=1500
 #   RMBENCH_NPROC=4 bash scripts/rmbench/train_single_task_rolling.sh put_back_block gradient_accumulation_steps=8
 
 set -euo pipefail
@@ -30,7 +30,7 @@ bash scripts/train_zero2.sh "${NPROC}" \
   task=rmbench_rolling_3cam_384_1e-4 \
   "data.dataset_dirs=[${TASK_DIR}]" \
   lr_scheduler_type=constant \
-  num_epochs=5 \
+  max_steps=1500 \
   batch_size=4 \
-  gradient_accumulation_steps=4 \
+  gradient_accumulation_steps=1 \
   "$@"
