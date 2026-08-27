@@ -24,6 +24,7 @@ class RollingWAM(WAM):
         cross_chunk_a2a_attn: bool = False,
         init_schedule_prob: float = 0.0,
         random_schedule_prob: float = 0.0,
+        constant_schedule_prob: float = 0.0,
     ):
         for a, b in (
             (self.train_video_scheduler, self.train_action_scheduler),
@@ -52,6 +53,8 @@ class RollingWAM(WAM):
             raise ValueError(f"`init_schedule_prob` must be in [0, 1], got {init_schedule_prob}")
         if not 0.0 <= random_schedule_prob <= 1.0:
             raise ValueError(f"`random_schedule_prob` must be in [0, 1], got {random_schedule_prob}")
+        if not 0.0 <= constant_schedule_prob <= 1.0:
+            raise ValueError(f"`constant_schedule_prob` must be in [0, 1], got {constant_schedule_prob}")
 
         self.window_blocks = int(window_blocks)
         self.chunk_latents = int(chunk_latents)
@@ -59,6 +62,7 @@ class RollingWAM(WAM):
         self.cross_chunk_a2a_attn = cross_chunk_a2a_attn
         self.init_schedule_prob = float(init_schedule_prob)
         self.random_schedule_prob = float(random_schedule_prob)
+        self.constant_schedule_prob = float(constant_schedule_prob)
         self.rolling_reset()
         return self
 
@@ -80,10 +84,13 @@ class RollingWAM(WAM):
     ROLLING_KEYS = (
         "window_blocks", "chunk_latents", "actions_per_chunk",
         "cross_chunk_a2a_attn", "init_schedule_prob", "random_schedule_prob",
+        "constant_schedule_prob",
     )
     ROLLING_LEGACY_DEFAULTS = {
         # Every checkpoint written before this option existed used same-chunk A2A.
         "cross_chunk_a2a_attn": False,
+        # Checkpoints written before the constant-level mixture trained without it.
+        "constant_schedule_prob": 0.0,
     }
 
     def get_rolling_config(self) -> dict[str, Any]:
@@ -211,6 +218,11 @@ class RollingWAM(WAM):
             return torch.zeros(batch_size, dtype=torch.bool)
         return torch.rand((batch_size,)) < self.random_schedule_prob
 
+    def _sample_constant_schedule(self, batch_size: int) -> torch.Tensor:
+        if self.constant_schedule_prob <= 0.0:
+            return torch.zeros(batch_size, dtype=torch.bool)
+        return torch.rand((batch_size,)) < self.constant_schedule_prob
+
     def training_loss(self, sample, tiled: bool = False):
         video = sample.get("video")
         if not isinstance(video, torch.Tensor) or video.ndim < 1:
@@ -220,10 +232,12 @@ class RollingWAM(WAM):
         if self.dit.training:
             init_cpu = self._sample_init_schedule(batch_size)
             random_cpu = self._sample_random_schedule(batch_size) & ~init_cpu
+            constant_cpu = self._sample_constant_schedule(batch_size) & ~init_cpu & ~random_cpu
         else:
             # deterministic val: steady layout at the slide-start state (t = 1)
             init_cpu = torch.zeros(batch_size, dtype=torch.bool)
             random_cpu = torch.zeros(batch_size, dtype=torch.bool)
+            constant_cpu = torch.zeros(batch_size, dtype=torch.bool)
 
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -267,6 +281,8 @@ class RollingWAM(WAM):
         if random_cpu.any():
             u_random = torch.rand((batch_size, W), device=device)
             u_chunk = torch.where(random_cpu.to(device=device).view(-1, 1), u_random, u_chunk)
+        if constant_cpu.any():
+            u_chunk = torch.where(constant_cpu.to(device=device).view(-1, 1), t_global, u_chunk)
         sch = self.train_video_scheduler
         sigma_chunk = sch._phi(u_chunk, sch.shift)
         t_window_chunk = sigma_chunk * n_steps

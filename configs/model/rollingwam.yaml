@@ -67,3 +67,4 @@ rolling:
   cross_chunk_a2a_attn: false
   init_schedule_prob: 0.2  # P(t_init); paper-prose beta=P(t_lin)=1-init_schedule_prob
   random_schedule_prob: 0.0  # chance of independent per-chunk noise levels (DF regularization); drawn among non-init samples
+  constant_schedule_prob: 0.2  # chance all chunks share one noise level (standard one-shot layout); drawn among non-init, non-random samples
