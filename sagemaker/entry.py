@@ -39,6 +39,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -115,8 +116,111 @@ def _is_complete_state_dir(path: Path, world_size: int) -> bool:
     """
     if not (path / "trainer_state.json").is_file():
         return False
-    shards = list(path.rglob("zero_pp_rank_*_optim_states.pt"))
+    # Leading * is required: DeepSpeed writes
+    # bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt, and a glob is anchored to
+    # the whole basename, so "zero_pp_rank_*" matched nothing and auto-resume
+    # silently rejected every complete checkpoint.
+    shards = list(path.rglob("*zero_pp_rank_*_optim_states.pt"))
     return len(shards) == world_size
+
+
+def _s3_names(prefix: str, recursive: bool = False) -> list[str]:
+    """``aws s3 ls`` a prefix; returns the last column of each line.
+
+    Directories come back as ``name/``; with ``recursive`` the names are keys
+    relative to the bucket. Returns [] on any error, so a missing prefix or an
+    expired credential degrades to "no checkpoint" rather than killing the job.
+    """
+    cmd = ["aws", "s3", "ls", prefix.rstrip("/") + "/"]
+    if recursive:
+        cmd.append("--recursive")
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    return [line.split()[-1] for line in done.stdout.splitlines() if line.strip()]
+
+
+def _s3_state_is_complete(step_prefix: str, world_size: int) -> bool:
+    """Same completeness rule as :func:`_is_complete_state_dir`, against S3."""
+    names = _s3_names(step_prefix, recursive=True)
+    if not any(n.endswith("trainer_state.json") for n in names):
+        return False
+    # Mirrors the glob in _is_complete_state_dir. Note the real filename is
+    # bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt — the rank index is NOT
+    # adjacent to the suffix, so the wildcard has to span _mp_rank_NN.
+    shards = [n for n in names if re.search(r"zero_pp_rank_.*optim_states\.pt$", n)]
+    return len(shards) == world_size
+
+
+def fetch_resume_from_s3(overrides: list[str], world_size: int) -> str | None:
+    """Pull the newest complete state checkpoint straight from S3.
+
+    Why this exists: SageMaker restores ``checkpoint_s3_uri`` into
+    /opt/ml/checkpoints in the BACKGROUND. The step_* directories and their
+    small files appear almost immediately, but the ~9 GB-per-rank optimizer
+    shards stream in for minutes afterwards, so :func:`find_auto_resume` runs
+    at container start and sees an incomplete tree — measured on a real spot
+    restart, which then retrained from step 0. Downloading the one checkpoint
+    we actually need is deterministic and finishes before training starts.
+
+    Returns the local dir to resume from, or None to start fresh. Any failure
+    returns None: a fresh start is always preferable to a crashed job.
+    """
+    if os.environ.get(f"{sm_env.ENV_PREFIX}_AUTO_RESUME", "true").lower() == "false":
+        return None
+    base = os.environ.get(f"{sm_env.ENV_PREFIX}_CHECKPOINT_S3")
+    if not base:
+        return None
+
+    output_dir: str | None = None
+    for token in overrides:
+        key = override_key(token)
+        if key == "resume":
+            return None
+        if key == "output_dir":
+            output_dir = token.split("=", 1)[1]
+    if not output_dir:
+        return None
+    try:
+        rel = Path(output_dir).resolve().relative_to(sm_env.SM_CHECKPOINT_DIR)
+    except ValueError:
+        # output_dir lives outside /opt/ml/checkpoints, so it is not mirrored.
+        return None
+
+    s3_state_root = f"{base.rstrip('/')}/{rel.as_posix()}/checkpoints/state"
+    steps: list[int] = []
+    for name in _s3_names(s3_state_root):
+        match = re.fullmatch(r"step_(\d+)/", name)
+        if match:
+            steps.append(int(match.group(1)))
+    if not steps:
+        return None
+
+    for step in sorted(steps, reverse=True):
+        src = f"{s3_state_root}/step_{step:06d}"
+        if not _s3_state_is_complete(src, world_size):
+            print(f"[entry] s3 checkpoint step_{step:06d} incomplete, trying older", flush=True)
+            continue
+        dst = Path(output_dir) / "checkpoints" / "state" / f"step_{step:06d}"
+        print(f"[entry] fetching resume checkpoint {src} -> {dst}", flush=True)
+        try:
+            dst.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["aws", "s3", "cp", "--recursive", "--only-show-errors",
+                 src + "/", str(dst) + "/"],
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[entry] resume fetch failed ({exc}); starting fresh", flush=True)
+            return None
+        if not _is_complete_state_dir(dst, world_size):
+            print("[entry] fetched checkpoint still incomplete; starting fresh", flush=True)
+            return None
+        return str(dst)
+    return None
 
 
 def find_auto_resume(overrides: list[str], world_size: int) -> str | None:
@@ -271,10 +375,17 @@ def main() -> None:
     overrides = merge_overrides(sm_overrides, user_argv)
 
     dist = sm_env.distributed_env()
-    resume_dir = find_auto_resume(overrides, dist["nproc_per_node"] * dist["num_machines"])
+    world_size = dist["nproc_per_node"] * dist["num_machines"]
+    # Prefer whatever SageMaker's restore already delivered (no download); fall
+    # back to pulling the checkpoint from S3 ourselves when that tree is still
+    # incomplete, which is the normal case on a spot restart.
+    resume_dir = find_auto_resume(overrides, world_size)
+    if resume_dir:
+        print(f"[entry] auto-resume from restored checkpoint: {resume_dir}", flush=True)
+    else:
+        resume_dir = fetch_resume_from_s3(overrides, world_size)
     if resume_dir:
         overrides.append(f"resume={resume_dir}")
-        print(f"[entry] auto-resume from restored checkpoint: {resume_dir}", flush=True)
 
     cmd = [
         "accelerate", "launch",
@@ -311,6 +422,29 @@ def main() -> None:
     print(f"[entry] channels={sm_env.channel_map()}", flush=True)
     print(f"[entry] dist={dist}", flush=True)
     print(f"[entry] {shlex.join(cmd)}", flush=True)
+
+    # Keep checkpoint_s3_uri small enough that SageMaker can restore it on a
+    # spot restart. Nothing prunes checkpoints otherwise, and past ~369 GB the
+    # restore fails with an opaque InternalServerError before the container
+    # starts (measured; see prune_checkpoints.py). Main host only, and every
+    # failure inside is swallowed — this must never be able to kill training.
+    if dist["machine_rank"] == 0 and os.environ.get(
+        f"{sm_env.ENV_PREFIX}_PRUNE_CHECKPOINTS", "true"
+    ).lower() != "false":
+        out_dir = next(
+            (t.split("=", 1)[1] for t in overrides if override_key(t) == "output_dir"), None
+        )
+        if out_dir:
+            try:
+                import prune_checkpoints
+
+                prune_checkpoints.spawn(
+                    out_dir,
+                    os.environ.get(f"{sm_env.ENV_PREFIX}_CHECKPOINT_S3", ""),
+                    keep=int(os.environ.get(f"{sm_env.ENV_PREFIX}_PRUNE_KEEP", "1")),
+                )
+            except Exception as exc:
+                print(f"[entry] checkpoint pruner not started ({exc}); continuing", flush=True)
 
     os.execvp(cmd[0], cmd)
 

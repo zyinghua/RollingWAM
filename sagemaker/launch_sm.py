@@ -94,7 +94,7 @@ ACCOUNT_CONFIGS = {
         # The reserved-capacity FSS pool authorizes this service role only.
         arn="arn:aws:iam::124224456861:role/service-role/SageMaker-SageMakerAllAccess",
         s3_bucket="tri-ml-sandbox-16011-us-west-2-datasets",
-        s3_checkpoint_base="s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/sagemaker",
+        s3_checkpoint_base="s3://tri-ml-sandbox-16011-us-west-2-datasets/sagemaker/junjie/rollingwam",
         use_queue=True,
         max_run=25 * 24 * 60 * 60 - 360,  # 25 days
         volume_size=3000,
@@ -104,7 +104,7 @@ ACCOUNT_CONFIGS = {
         profile="rob-sm",
         arn="arn:aws:iam::385697366450:role/Robotics-WFM-Sagemaker-role-us-west-2",
         s3_bucket="tri-ml-sandbox-16011-us-west-2-datasets",
-        s3_checkpoint_base="s3://tri-ml-sandbox-16011-us-west-2-datasets/rollingwam/sagemaker",
+        s3_checkpoint_base="s3://tri-ml-sandbox-16011-us-west-2-datasets/sagemaker/junjie/rollingwam",
         use_queue=True,
         max_run=5 * 24 * 60 * 60 - 360,
         volume_size=1000,
@@ -308,7 +308,7 @@ def main() -> None:
     timestamp = f"{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond // 1000:03d}"
     job_name = make_job_name(task, user, args.name or timestamp)
 
-    output_base = f"{account['s3_checkpoint_base'].rstrip('/')}/{user}"
+    output_base = account["s3_checkpoint_base"].rstrip("/")
     checkpoint_s3 = f"{output_base}/{job_name}"
 
     channels = target["channels"]
@@ -316,6 +316,7 @@ def main() -> None:
         "SAGEMAKER_PROGRAM": ENTRY_POINT,
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         f"{ENV_PREFIX}_INPUT_CHANNEL_COUNT": str(len(channels)),
+        f"{ENV_PREFIX}_CHECKPOINT_S3": checkpoint_s3,
     }
     if not args.spot:
         # FSS reserved-capacity Batch queues reject the job without this — and

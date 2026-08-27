@@ -49,8 +49,12 @@ channels:
   # and load_dataset reads every parquet, which is a metadata storm on a lazily
   # mounted prefix. LIBERO is far smaller than RoboTwin, so the up-front
   # download is short.
+  # The four *_no_noops_lerobot dirs sit directly under libero-fastwam/, not in
+  # a libero_mujoco3.3.2/ subdir. Mounting the parent also pulls the ~4.4 GB of
+  # .tar.gz archives beside them (8.8 GB total vs 4.4 GB) — a channel takes a
+  # prefix, not an exclude list, and at this size it is not worth four channels.
   libero:
-    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero-fastwam/libero_mujoco3.3.2
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/libero-fastwam
     mode: File
     distribution: FullyReplicated
   # Flat, hash-addressed, and small (one file per distinct instruction), so
