@@ -48,7 +48,7 @@ RUN pip install --upgrade pip setuptools wheel
 #    treats them as satisfied instead of pulling CPU wheels over them.
 RUN pip install --no-deps \
         --extra-index-url=https://download.pytorch.org/whl/cu128 \
-        torch==2.7.1 torchvision==0.22.1 torchcodec==0.5
+        torch==2.7.1 torchvision==0.22.1 torchcodec==0.4.0
 
 # 2. Everything else from pyproject, generated at build time so it cannot drift
 #    from the repo's pins (the torch family is filtered out — see step 1).
