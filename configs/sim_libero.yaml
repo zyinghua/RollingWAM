@@ -26,6 +26,7 @@ EVALUATION:
 
   # Action inference
   num_inference_steps: 10  # must be divisible by model.rolling.window_blocks
+  compile_action_infer: false  # torch.compile joint rolling denoiser; warmup required
   text_cfg_scale: 1.0
   negative_prompt: ""
 

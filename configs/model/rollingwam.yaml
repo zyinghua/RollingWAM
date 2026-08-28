@@ -6,6 +6,9 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
+compile_training_denoise: false  # requires mot/expert gradient checkpointing=false
+vae_encode_batch_size: 1  # 1: per-video encoding; 0: full-batch path
+compile_vae_encode: false  # CUDA Graphs for the frozen encoder; requires CUDA
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 

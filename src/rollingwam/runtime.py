@@ -90,6 +90,9 @@ def create_wam(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    compile_training_denoise: bool = False,
+    vae_encode_batch_size: int = 1,
+    compile_vae_encode: bool = False,
 ):
     from .models.wan22.wam import WAM
 
@@ -155,6 +158,9 @@ def create_wam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        compile_training_denoise=bool(compile_training_denoise),
+        vae_encode_batch_size=int(vae_encode_batch_size),
+        compile_vae_encode=bool(compile_vae_encode),
     )
 
 
@@ -176,6 +182,9 @@ def create_rollingwam(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    compile_training_denoise: bool = False,
+    vae_encode_batch_size: int = 1,
+    compile_vae_encode: bool = False,
 ):
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -249,6 +258,9 @@ def create_rollingwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        compile_training_denoise=bool(compile_training_denoise),
+        vae_encode_batch_size=int(vae_encode_batch_size),
+        compile_vae_encode=bool(compile_vae_encode),
     )
 
 
@@ -351,6 +363,10 @@ def run_inference(cfg: DictConfig):
         "tiled": bool(inference_cfg.tiled),
     }
 
+    if bool(inference_cfg.get("compile_action_infer", False)):
+        if "compile_action_infer" not in inspect.signature(model.infer).parameters:
+            raise ValueError("This model does not support `compile_action_infer`.")
+        infer_kwargs["compile_action_infer"] = True
     infer_out = model.infer(**infer_kwargs)
     video = infer_out["video"]
     save_mp4(video, output_mp4, fps=15)

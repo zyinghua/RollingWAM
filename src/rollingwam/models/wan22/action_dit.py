@@ -100,6 +100,21 @@ class ActionDiT(nn.Module):
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        device = next(self.parameters()).device
+        # Keep a real source when parameters move to meta so to_empty() can
+        # materialize the module without losing these precomputed constants.
+        if device.type != "meta":
+            self.freqs = self.freqs.to(device=device)
+        return result
+
+    def get_freqs(self, seq_len: int) -> torch.Tensor:
+        freqs = self.freqs[:seq_len].view(seq_len, 1, -1)
+        if self.action_encoder.weight.device.type == "meta":
+            freqs = freqs.to(device="meta")
+        return freqs
+
     @classmethod
     def backbone_key_set(cls, keys) -> set[str]:
         return {
@@ -223,13 +238,14 @@ class ActionDiT(nn.Module):
         )
         return action_expert.to(device=device, dtype=torch_dtype)
 
-    def pre_dit(
+    def prepare(
         self,
         action_tokens: torch.Tensor,
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare tensor inputs for the compile-friendly DiT/MoT core."""
         if action_tokens.ndim != 3:
             raise ValueError(
                 f"`action_tokens` must be 3D [B, T, action_dim], got shape {tuple(action_tokens.shape)}"
@@ -296,7 +312,23 @@ class ActionDiT(nn.Module):
         tokens = self.action_encoder(action_tokens)
         context_emb = self.text_embedding(context)
         context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
-        freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
+        freqs = self.get_freqs(seq_len)
+
+        return tokens, t, t_mod, context_emb, context_attn_mask, freqs
+
+    def pre_dit(
+        self,
+        action_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        tokens, t, t_mod, context_emb, context_attn_mask, freqs = self.prepare(
+            action_tokens=action_tokens,
+            timestep=timestep,
+            context=context,
+            context_mask=context_mask,
+        )
 
         return {
             "tokens": tokens,
@@ -306,12 +338,16 @@ class ActionDiT(nn.Module):
             "context": context_emb,
             "context_mask": context_attn_mask,
             "meta": {
-                "batch_size": batch_size,
-                "seq_len": seq_len,
+                "batch_size": action_tokens.shape[0],
+                "seq_len": action_tokens.shape[1],
             },
         }
 
     def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
+        return self.head(tokens)
+
+    def post(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Project action tokens produced by the tensor core."""
         return self.head(tokens)
 
     def forward(

@@ -321,38 +321,26 @@ class RollingWAM(WAM):
         action_tokens = noisy_window_action
         timestep_action = t_window_action
 
-        video_pre = self.video_expert.pre_dit(
-            x=noisy_latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+        patch_h, patch_w = self.video_expert.patch_size[1:]
+        tokens_per_frame = (
+            (noisy_latents.shape[3] // patch_h) * (noisy_latents.shape[4] // patch_w)
         )
-        action_pre = self.action_expert.pre_dit(
-            action_tokens=action_tokens,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
-
         attention_mask = self._build_rolling_attention_mask(
             win_chunks=W,
-            tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            tokens_per_frame=tokens_per_frame,
             actions_per_chunk=aspc,
             device=device,
         )
-        tokens_out = self.mot(
-            embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
+        pred_video, pred_action = self._joint_denoise_core(
+            latents_video=noisy_latents,
+            latents_action=action_tokens,
+            timestep_video=timestep_video,
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
             attention_mask=attention_mask,
-            freqs_all={"video": video_pre["freqs"], "action": action_pre["freqs"]},
-            context_all={
-                "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
-                "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
-            },
-            t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
         pred_w = pred_video[:, :, 1:]
         video_loss_frame = torch.nn.functional.mse_loss(
@@ -466,6 +454,8 @@ class RollingWAM(WAM):
         negative_context: Optional[torch.Tensor] = None,
         negative_context_mask: Optional[torch.Tensor] = None,
         advance: Optional[list] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        compile_action_infer: bool = False,
     ):
         """One denoise pass over the window against the latest-observation anchor.
         `advance[j]=False` freezes chunk j (boundary init phase: clipped chunks stay pure noise)."""
@@ -483,45 +473,37 @@ class RollingWAM(WAM):
         timestep_video[0, 1:] = t_chunk.repeat_interleave(nfpb)
         t_window_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)           # [1, win*aspc]
 
+        if attention_mask is None:
+            patch_h, patch_w = self.video_expert.patch_size[1:]
+            attention_mask = self._build_rolling_attention_mask(
+                win_chunks=win,
+                tokens_per_frame=(latents.shape[3] // patch_h) * (latents.shape[4] // patch_w),
+                actions_per_chunk=aspc,
+                device=self.device,
+            )
+        joint_denoise_core = self._get_joint_denoise_core(compile_action_infer)
+
         def predict(ctx, ctx_mask):
-            video_pre = self.video_expert.pre_dit(
-                x=latents,
-                timestep=timestep_video,
+            if compile_action_infer:
+                torch.compiler.cudagraph_mark_step_begin()
+            return joint_denoise_core(
+                latents_video=latents,
+                latents_action=self._window_action,
+                timestep_video=timestep_video,
+                timestep_action=t_window_action,
                 context=ctx,
                 context_mask=ctx_mask,
+                attention_mask=attention_mask,
                 fuse_vae_embedding_in_latents=bool(
                     getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
                 ),
             )
-            action_pre = self.action_expert.pre_dit(
-                action_tokens=self._window_action,
-                timestep=t_window_action,
-                context=ctx,
-                context_mask=ctx_mask,
-            )
-            attention_mask = self._build_rolling_attention_mask(
-                win_chunks=win,
-                tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-                actions_per_chunk=aspc,
-                device=self.device,
-            )
-            tokens_out = self.mot(
-                embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
-                attention_mask=attention_mask,
-                freqs_all={"video": video_pre["freqs"], "action": action_pre["freqs"]},
-                context_all={
-                    "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
-                    "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
-                },
-                t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
-            )
-            return (
-                self.video_expert.post_dit(tokens_out["video"], video_pre),
-                self.action_expert.post_dit(tokens_out["action"], action_pre),
-            )
 
         pred_video, pred_action = predict(context, context_mask)
         if text_cfg_scale != 1.0 and negative_context is not None:
+            if compile_action_infer:
+                # The negative pass may replay into the same CUDA Graph output buffers.
+                pred_video, pred_action = pred_video.clone(), pred_action.clone()
             pred_video_neg, _ = predict(negative_context, negative_context_mask)
             pred_video = pred_video_neg + text_cfg_scale * (pred_video - pred_video_neg)
             # action keeps the conditional prediction
@@ -550,6 +532,7 @@ class RollingWAM(WAM):
         text_cfg_scale: float = 1.0,
         seed: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
+        compile_action_infer: bool = False,
     ) -> dict[str, Any]:
         """One control step: condition on the latest observation and roll video and
         actions jointly. Returns {'action': [aspc, action_dim], 'video': front chunk latents}."""
@@ -618,6 +601,13 @@ class RollingWAM(WAM):
         )
         aspc = self.actions_per_chunk
         ladder_t, ladder_delta = self._rolling_ladder(S, self.device, torch.float32)
+        patch_h, patch_w = self.video_expert.patch_size[1:]
+        attention_mask = self._build_rolling_attention_mask(
+            win_chunks=W,
+            tokens_per_frame=(latent_h // patch_h) * (latent_w // patch_w),
+            actions_per_chunk=aspc,
+            device=self.device,
+        )
 
         if first_call:
             # boundary init phase (t^init): full window of pure noise; chunk j stays
@@ -629,6 +619,8 @@ class RollingWAM(WAM):
                     anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
                     text_cfg_scale, negative_context, negative_context_mask,
                     advance=[p >= j * sub for j in range(W)],
+                    attention_mask=attention_mask,
+                    compile_action_infer=compile_action_infer,
                 )
         else:
             self._push_noise_chunk(z, latent_h, latent_w, aspc, seed)
@@ -636,6 +628,8 @@ class RollingWAM(WAM):
                 self._window_pass(
                     anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
                     text_cfg_scale, negative_context, negative_context_mask,
+                    attention_mask=attention_mask,
+                    compile_action_infer=compile_action_infer,
                 )
 
         video_front, action_front = self._pop_front_chunk(aspc)
@@ -664,6 +658,7 @@ class RollingWAM(WAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        compile_action_infer: bool = False,
         **_: Any,
     ) -> dict[str, Any]:
         """Open-loop rollout for evaluation: rolling generation from one image, feeding the
@@ -717,6 +712,7 @@ class RollingWAM(WAM):
                 text_cfg_scale=text_cfg_scale,
                 seed=seed,
                 num_inference_steps=num_inference_steps,
+                compile_action_infer=compile_action_infer,
             )
             emitted_action.append(out["action"])
             emitted_video.append(out["video"])

@@ -263,6 +263,7 @@ def _predict_action_chunk(
             text_cfg_scale=float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
             seed=None if cfg.get("seed") is None else int(cfg.seed),
             num_inference_steps=num_inference_steps,
+            compile_action_infer=bool(cfg.EVALUATION.get("compile_action_infer", False)),
         )
     action = pred["action"]  # [aspc, D]
 

@@ -152,6 +152,7 @@ class WorldActionRobotWinPolicy:
         save_imagined_rollouts: bool = False,
         imagined_dir: Optional[Path] = None,
         replan_steps: Optional[int] = None,
+        compile_action_infer: bool = False,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -169,6 +170,7 @@ class WorldActionRobotWinPolicy:
         self.text_cfg_scale = float(text_cfg_scale)
         self.negative_prompt = str(negative_prompt)
         self.timing_enabled = bool(timing_enabled)
+        self.compile_action_infer = bool(compile_action_infer)
 
         self.replan_steps = None if replan_steps is None else int(replan_steps)
         if self.replan_steps is not None:
@@ -281,6 +283,7 @@ class WorldActionRobotWinPolicy:
                 text_cfg_scale=self.text_cfg_scale,
                 seed=self.seed,
                 num_inference_steps=self.num_inference_steps,
+                compile_action_infer=self.compile_action_infer,
             )
         if self.timing_enabled:
             infer_elapsed = time.perf_counter() - infer_t0
@@ -406,6 +409,12 @@ def get_model(usr_args: Dict[str, Any]):
         sim_cfg_name=sim_cfg_name,
         sim_task=sim_task,
     )
+    cfg.model.vae_encode_batch_size = int(
+        usr_args.get("vae_encode_batch_size", cfg.model.get("vae_encode_batch_size", 1))
+    )
+    cfg.model.compile_vae_encode = _parse_bool(
+        usr_args.get("compile_vae_encode", cfg.model.get("compile_vae_encode", False))
+    )
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):
@@ -461,6 +470,9 @@ def get_model(usr_args: Dict[str, Any]):
         save_imagined_rollouts=save_imagined_rollouts,
         imagined_dir=imagined_dir,
         replan_steps=replan_steps,
+        compile_action_infer=_parse_bool(
+            usr_args.get("compile_action_infer", cfg.EVALUATION.get("compile_action_infer", False))
+        ),
     )
     return policy
 

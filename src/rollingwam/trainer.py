@@ -2,7 +2,9 @@ import logging
 import json
 import inspect
 import os
+import random
 import re
+from itertools import islice
 from math import ceil
 from pathlib import Path
 import time
@@ -123,6 +125,9 @@ class Wan22Trainer:
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
+        if bool(getattr(self.model, "compile_training_denoise", False)):
+            self._warmup_training_denoise()
+
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
@@ -133,6 +138,46 @@ class Wan22Trainer:
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
+
+    def _warmup_training_denoise(self):
+        # Compile forward/backward before DeepSpeed installs its hooks.
+        logger.info("Compiling training denoise forward/backward before DeepSpeed initialization.")
+        compile_start = time.perf_counter()
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        device = self.accelerator.device
+        cuda_devices = [device] if device.type == "cuda" else []
+        try:
+            # Preserve the exact RNG stream, including dataset augmentation, rather
+            # than letting this extra batch change the real training samples/noise.
+            with torch.random.fork_rng(devices=cuda_devices):
+                warmup_loader = DataLoader(
+                    self.train_dataset,
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    sampler=list(islice(self.train_sampler, self.batch_size)),
+                    num_workers=1 if self.num_workers > 0 else 0,
+                    worker_init_fn=self.train_loader.worker_init_fn,
+                )
+                # Do not initialize video decoders in the parent before forking
+                # training workers. Exhaust this one-batch loader to shut down its
+                # temporary worker before compiling the GPU forward/backward.
+                warmup_sample, = warmup_loader
+                with self.accelerator.autocast():
+                    warmup_loss, _ = self.model.training_loss(warmup_sample)
+                warmup_loss.backward()
+                self.optimizer.zero_grad(set_to_none=True)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                del warmup_loss, warmup_sample, warmup_loader
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+        logger.info(
+            "Finished training denoise compile warmup in %.2f seconds.",
+            time.perf_counter() - compile_start,
+        )
 
     def _init_wandb(self):
         if not self.wandb_enabled or not self.accelerator.is_main_process:

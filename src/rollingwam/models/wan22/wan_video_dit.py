@@ -53,12 +53,13 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
-        x.shape[0], x.shape[1], x.shape[2], -1, 2))
+    batch_size, seq_len, _ = x.shape
+    x_heads = x.view(batch_size, seq_len, num_heads, -1)
+    x_out = torch.view_as_complex(
+        x_heads.to(torch.float64).reshape(batch_size, seq_len, num_heads, -1, 2)
+    )
     freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+    return torch.view_as_real(x_out * freqs).flatten(2).to(x.dtype)
 
 
 def create_group_causal_attn_mask(
@@ -397,7 +398,28 @@ class WanVideoDiT(torch.nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         if self.use_gradient_checkpointing:
             logger.info("Using gradient checkpointing for DiT blocks. This will save memory but use more computation.")
-            
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        device = next(self.parameters()).device
+        # Meta tensors have no data; retain the real frequencies for to_empty().
+        if device.type != "meta":
+            self.freqs = tuple(freqs.to(device=device) for freqs in self.freqs)
+        return result
+
+    def get_freqs(self, f: int, h: int, w: int) -> torch.Tensor:
+        freq_f, freq_h, freq_w = self.freqs
+        freqs = torch.cat(
+            [
+                freq_f[:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freq_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freq_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(f * h * w, 1, -1)
+        if self.patch_embedding.weight.device.type == "meta":
+            freqs = freqs.to(device="meta")
+        return freqs
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
@@ -511,7 +533,7 @@ class WanVideoDiT(torch.nn.Module):
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
 
-    def pre_dit(
+    def prepare(
         self,
         x: torch.Tensor,
         timestep: torch.Tensor,
@@ -520,7 +542,19 @@ class WanVideoDiT(torch.nn.Module):
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
         control_camera_latents_input: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+        int,
+    ]:
+        """Prepare tensor inputs for the compile-friendly DiT/MoT core."""
         x, timestep, context_mask = self._validate_forward_inputs(
             x=x,
             timestep=timestep,
@@ -609,11 +643,29 @@ class WanVideoDiT(torch.nn.Module):
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
+        freqs = self.get_freqs(f, h, w)
+
+        return x_tokens, t, t_mod, context, context_mask, freqs, f, h, w, tokens_per_frame
+
+    def pre_dit(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
+        fuse_vae_embedding_in_latents: bool = False,
+        control_camera_latents_input: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        x_tokens, t, t_mod, context, context_mask, freqs, f, h, w, tokens_per_frame = self.prepare(
+            x=x,
+            timestep=timestep,
+            context=context,
+            context_mask=context_mask,
+            action=action,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            control_camera_latents_input=control_camera_latents_input,
+        )
 
         return {
             "tokens": x_tokens,
@@ -625,7 +677,7 @@ class WanVideoDiT(torch.nn.Module):
             "meta": {
                 "grid_size": (f, h, w),
                 "tokens_per_frame": tokens_per_frame,
-                "batch_size": batch_size,
+                "batch_size": context.shape[0],
             },
         }
 
@@ -634,6 +686,17 @@ class WanVideoDiT(torch.nn.Module):
         x = self.head(x_tokens, pre_state["t"])
         x = self.unpatchify(x, (f, h, w))
         return x
+
+    def post(
+        self,
+        x_tokens: torch.Tensor,
+        t: torch.Tensor,
+        f: int,
+        h: int,
+        w: int,
+    ) -> torch.Tensor:
+        """Convert tensor-core video tokens back into latent predictions."""
+        return self.unpatchify(self.head(x_tokens, t), (f, h, w))
 
     def forward(
         self,

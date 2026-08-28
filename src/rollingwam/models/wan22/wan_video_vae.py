@@ -1067,15 +1067,32 @@ class WanVideoVAE(nn.Module):
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
-        self.mean = torch.tensor(mean)
         self.std = torch.tensor(std)
-        self.scale = [self.mean, 1.0 / self.std]
+        self.register_buffer("mean", torch.tensor(mean), persistent=False)
+        self.register_buffer("inv_std", self.std.reciprocal(), persistent=False)
 
         # init model
         self.model = VideoVAE_(z_dim=z_dim).eval().requires_grad_(False)
         self.upsampling_factor = 8
         self.temporal_downsample_factor = 4
         self.z_dim = z_dim
+
+    @property
+    def scale(self):
+        return [self.mean, self.inv_std]
+
+    def _apply(self, fn, recurse=True):
+        # Keep scale constants at source precision when moving or casting the
+        # model. Encode/decode cast them to the activation dtype at point of use.
+        scale_buffers = {name: self._buffers[name] for name in ("mean", "inv_std")}
+        super()._apply(fn, recurse=recurse)
+        for name, original in scale_buffers.items():
+            moved = self._buffers[name]
+            if not original.is_meta:
+                # Nonpersistent constants cannot be restored from a checkpoint;
+                # retain their data through meta/to_empty initialization too.
+                self._buffers[name] = original if moved.is_meta else original.to(device=moved.device)
+        return self
 
 
     def build_1d_mask(self, length, left_bound, right_bound, border_width):
@@ -1373,9 +1390,9 @@ class WanVideoVAE38(WanVideoVAE):
             0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
             0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744
         ]
-        self.mean = torch.tensor(mean)
         self.std = torch.tensor(std)
-        self.scale = [self.mean, 1.0 / self.std]
+        self.register_buffer("mean", torch.tensor(mean), persistent=False)
+        self.register_buffer("inv_std", self.std.reciprocal(), persistent=False)
 
         # init model
         self.model = VideoVAE38_(z_dim=z_dim, dim=dim).eval().requires_grad_(False)
