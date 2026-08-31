@@ -1,4 +1,5 @@
 import atexit
+import json
 import logging
 import os
 import sys
@@ -60,6 +61,24 @@ def _parse_optional_int(value: Any) -> Optional[int]:
         return None
     return int(value)
 
+
+def _timing_stats_ms(values: list[float]) -> Dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean_ms": None,
+            "std_ms": None,
+            "min_ms": None,
+            "max_ms": None,
+        }
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "mean_ms": float(array.mean()),
+        "std_ms": float(array.std()),
+        "min_ms": float(array.min()),
+        "max_ms": float(array.max()),
+    }
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -153,6 +172,8 @@ class WorldActionRobotWinPolicy:
         imagined_dir: Optional[Path] = None,
         replan_steps: Optional[int] = None,
         compile_action_infer: bool = False,
+        timing_result_path: Optional[Path] = None,
+        timing_task_name: Optional[str] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -171,6 +192,31 @@ class WorldActionRobotWinPolicy:
         self.negative_prompt = str(negative_prompt)
         self.timing_enabled = bool(timing_enabled)
         self.compile_action_infer = bool(compile_action_infer)
+        self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
+        self.timing_task_name = timing_task_name
+        self.timing_result_path = timing_result_path
+
+        window_blocks = int(self.model.window_blocks)
+        if self.num_inference_steps % window_blocks != 0:
+            raise ValueError(
+                f"num_inference_steps ({self.num_inference_steps}) must be divisible by "
+                f"checkpoint window_blocks ({window_blocks})"
+            )
+        expected_w = os.environ.get("ROLLINGWAM_TIMING_EXPECTED_W")
+        if expected_w is not None and window_blocks != int(expected_w):
+            raise ValueError(
+                f"Timing manifest expects W={expected_w}, but checkpoint restored W={window_blocks}"
+            )
+        expected_chunk_latents = os.environ.get("ROLLINGWAM_TIMING_EXPECTED_CHUNK_LATENTS")
+        if (
+            expected_chunk_latents is not None
+            and int(self.model.chunk_latents) != int(expected_chunk_latents)
+        ):
+            raise ValueError(
+                "Timing manifest expects chunk_latents="
+                f"{expected_chunk_latents}, but checkpoint restored "
+                f"chunk_latents={self.model.chunk_latents}"
+            )
 
         self.replan_steps = None if replan_steps is None else int(replan_steps)
         if self.replan_steps is not None:
@@ -198,10 +244,14 @@ class WorldActionRobotWinPolicy:
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
         self._replan_times: list[float] = []
+        self._timing_records: list[Dict[str, Any]] = []
         self._timing_warmed_up = False
         self._prompt_cache: Optional[tuple[str, tuple[torch.Tensor, torch.Tensor]]] = None
         if self.timing_enabled:
             atexit.register(self._log_replan_timing)
+            if self.timing_result_path is not None:
+                self.timing_result_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("Replan timing JSON | %s", self.timing_result_path)
 
         if save_imagined_rollouts and imagined_dir is None:
             raise ValueError(
@@ -402,18 +452,78 @@ class WorldActionRobotWinPolicy:
             return
         # the first replan runs the full init phase (S passes); steady replans run S/W
         init_s, steady = self._replan_times[0], self._replan_times[1:]
+        init_ms = init_s * 1000.0
+        steady_ms = [value * 1000.0 for value in steady]
+        steady_stats = _timing_stats_ms(steady_ms)
         logger.info(
             "Replan timing | initialization %.3f ms | "
             "steady-state mean %.3f ms min %.3f ms max %.3f ms "
             "(n=%d) | total replans=%d",
-            init_s * 1000.0,
-            1000.0 * sum(steady) / len(steady) if steady else float("nan"),
-            1000.0 * min(steady) if steady else float("nan"),
-            1000.0 * max(steady) if steady else float("nan"),
+            init_ms,
+            steady_stats["mean_ms"] if steady else float("nan"),
+            steady_stats["min_ms"] if steady else float("nan"),
+            steady_stats["max_ms"] if steady else float("nan"),
             len(steady),
             len(self._replan_times),
         )
+        self._timing_records.append(
+            {
+                "episode": self.episode_count,
+                "initialization_ms": init_ms,
+                "steady_state_ms": steady_ms,
+                "steady_state": steady_stats,
+                "total_replans": len(self._replan_times),
+            }
+        )
+        self._write_timing_results()
         self._replan_times = []
+
+    def _write_timing_results(self) -> None:
+        if self.timing_result_path is None:
+            return
+        initialization_ms = [record["initialization_ms"] for record in self._timing_records]
+        steady_ms = [
+            value
+            for record in self._timing_records
+            for value in record["steady_state_ms"]
+        ]
+        window_blocks = int(self.model.window_blocks)
+        actions_per_chunk = int(self.model.actions_per_chunk)
+        result = {
+            "schema_version": 1,
+            "policy": "rollingwam",
+            "unit": "ms",
+            "task_name": self.timing_task_name,
+            "checkpoint": self.checkpoint_path,
+            "model": {
+                "window_blocks": window_blocks,
+                "chunk_latents": int(self.model.chunk_latents),
+                "actions_per_chunk": actions_per_chunk,
+                "window_action_horizon": window_blocks * actions_per_chunk,
+                "emitted_actions_per_replan": actions_per_chunk,
+                "executed_actions_per_replan": (
+                    actions_per_chunk if self.replan_steps is None else self.replan_steps
+                ),
+                "num_inference_steps": self.num_inference_steps,
+                "initialization_denoising_steps": self.num_inference_steps,
+                "steady_denoising_steps_per_replan": self.num_inference_steps // window_blocks,
+            },
+            "episodes": self._timing_records,
+            "aggregate": {
+                "episodes": len(self._timing_records),
+                "initialization": _timing_stats_ms(initialization_ms),
+                "steady_state": _timing_stats_ms(steady_ms),
+                "total_replans": sum(record["total_replans"] for record in self._timing_records),
+            },
+        }
+        temporary_path = self.timing_result_path.with_suffix(
+            self.timing_result_path.suffix + ".tmp"
+        )
+        temporary_path.write_text(
+            json.dumps(result, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(self.timing_result_path)
 
     def reset(self) -> None:
         self.pending_actions.clear()
@@ -471,6 +581,16 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    timing_result_path: Optional[Path] = None
+    if timing_enabled:
+        configured_result_path = os.environ.get("WAM_TIMING_RESULT_PATH")
+        if not _is_none_like(configured_result_path):
+            timing_result_path = Path(str(configured_result_path)).expanduser().resolve()
+        elif not _is_none_like(usr_args.get("eval_output_dir")):
+            timing_result_path = (
+                Path(str(usr_args["eval_output_dir"])).expanduser().resolve()
+                / "replan_timing.json"
+            )
     replan_steps = _parse_optional_int(
         usr_args.get("replan_steps", cfg.EVALUATION.get("replan_steps"))
     )
@@ -502,6 +622,10 @@ def get_model(usr_args: Dict[str, Any]):
         replan_steps=replan_steps,
         compile_action_infer=_parse_bool(
             usr_args.get("compile_action_infer", cfg.EVALUATION.get("compile_action_infer", False))
+        ),
+        timing_result_path=timing_result_path,
+        timing_task_name=(
+            None if _is_none_like(usr_args.get("task_name")) else str(usr_args["task_name"])
         ),
     )
     return policy
