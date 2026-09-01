@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - train
+  - override /task: domino_selected_tasks_rolling_3cam_384_1e-4
+  - _self_
+
+ckpt: null
+gpu_id: 0
+
+model:
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+
+EVALUATION:
+  domino_root: third_party/DOMINO
+  policy_name: rollingwam_policy
+  task_name: null
+  dynamic_level: null
+  task_config: null
+  instruction_type: unseen
+  # DOMINO's native evaluator runs 100 episodes (or every entry in a shorter
+  # fixed episode manifest). Keep benchmark behavior in the benchmark itself.
+  output_dir: ./evaluate_results/domino/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
+
+  num_inference_steps: 10  # must be divisible by model.rolling.window_blocks
+  compile_action_infer: false
+  text_cfg_scale: 1.0
+  negative_prompt: ""
+  timing_enabled: false
+  save_imagined_rollouts: false
+  episode_manifest: null
+
+  dataset_stats_path: null
+  device: cuda
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

@@ -1,0 +1,47 @@
+defaults:
+  - robotwin
+  - _self_
+
+# Fifty demonstrations per level-qualified task (100 demonstrations total).
+dataset_root: /datasets/DOMINO/rollingwam-domino
+dataset_dirs:
+  - ${data.dataset_root}/beat_block_hammer_level2
+  - ${data.dataset_root}/place_bread_basket_level1
+text_embedding_cache_dir: ${data.dataset_root}/text_embeds_cache
+
+# DOMINO retains RoboTwin's aloha-agilex embodiment, three D435 cameras, and
+# 14-D absolute joint state/action. Its native videos are 240x320 at 15 fps.
+shape_meta:
+  images:
+    - key: cam_high
+      raw_shape: [3, 240, 320]
+      shape: [3, 240, 320]
+    - key: cam_left_wrist
+      raw_shape: [3, 240, 320]
+      shape: [3, 240, 320]
+    - key: cam_right_wrist
+      raw_shape: [3, 240, 320]
+      shape: [3, 240, 320]
+  action:
+    - key: default
+      raw_shape: 14
+      shape: 14
+  state:
+    - key: default
+      raw_shape: 14
+      shape: 14
+
+train:
+  dataset_dirs: ${data.dataset_dirs}
+  shape_meta: ${data.shape_meta}
+  val_set_proportion: 0.0
+  pretrained_norm_stats: null
+  text_embedding_cache_dir: ${data.text_embedding_cache_dir}
+
+val:
+  dataset_dirs: ${data.dataset_dirs}
+  shape_meta: ${data.shape_meta}
+  # Monitoring only; this intentionally overlaps the small training collection.
+  val_set_proportion: 0.01
+  pretrained_norm_stats: null
+  text_embedding_cache_dir: ${data.text_embedding_cache_dir}

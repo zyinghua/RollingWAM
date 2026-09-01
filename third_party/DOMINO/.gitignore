@@ -30,6 +30,7 @@ assets/*
 !assets/static/
 
 policy/weights/*
+/policy/rollingwam_policy
 
 envs/curobo/*
 
