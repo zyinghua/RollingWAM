@@ -32,6 +32,12 @@ EVALUATION:
   save_imagined_rollouts: false
   episode_manifest: null
 
+  # Expert qpos rows are captured every 15 ticks in the 250-Hz simulator.
+  # DOMINO advances its dynamic target once per 10-Hz policy step, so execute
+  # the complete predicted path at that rate while preserving each endpoint.
+  action_source_hz: 16.6666666667
+  action_target_hz: 10.0
+
   dataset_stats_path: null
   device: cuda
 

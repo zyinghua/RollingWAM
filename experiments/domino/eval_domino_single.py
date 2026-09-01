@@ -1,8 +1,8 @@
 """Evaluate one DOMINO task with a RollingWAM checkpoint.
 
-This wrapper validates the DOMINO dynamic-task setup, exposes the shared
-RollingWAM RoboTwin policy through DOMINO's policy directory, and delegates to
-DOMINO's native evaluation entrypoint.  DOMINO therefore remains responsible
+This wrapper validates the DOMINO dynamic-task setup, exposes the dedicated
+RollingWAM DOMINO policy through DOMINO's policy directory, and delegates to
+DOMINO's native evaluation entrypoint. DOMINO therefore remains responsible
 for dynamic episode initialization, success checks, and manipulation metrics.
 """
 
@@ -78,11 +78,25 @@ def _ensure_policy_symlink(domino_root: Path, policy_source_dir: Path) -> Path:
         except FileExistsError:
             pass  # Another evaluator may have created it concurrently.
 
-    if policy_target.is_symlink() and policy_target.resolve() == source_resolved:
-        return policy_target
     if policy_target.is_symlink():
+        target_resolved = policy_target.resolve()
+        if target_resolved == source_resolved:
+            return policy_target
+
+        legacy_source = (
+            PROJECT_ROOT / "experiments" / "robotwin" / POLICY_NAME
+        ).resolve()
+        if target_resolved == legacy_source:
+            temporary_link = policy_root / f".{POLICY_NAME}.{os.getpid()}.tmp"
+            try:
+                temporary_link.symlink_to(source_resolved, target_is_directory=True)
+                os.replace(temporary_link, policy_target)
+            finally:
+                temporary_link.unlink(missing_ok=True)
+            return policy_target
+
         raise RuntimeError(
-            f"Policy symlink conflict: {policy_target} -> {policy_target.resolve()}, "
+            f"Policy symlink conflict: {policy_target} -> {target_resolved}, "
             f"expected -> {source_resolved}"
         )
     raise RuntimeError(
@@ -259,7 +273,7 @@ def main(cfg: DictConfig) -> None:
         dynamic_level=dynamic_level,
     )
 
-    policy_source_dir = PROJECT_ROOT / "experiments" / "robotwin" / POLICY_NAME
+    policy_source_dir = PROJECT_ROOT / "experiments" / "domino" / POLICY_NAME
     if not policy_source_dir.is_dir():
         raise FileNotFoundError(f"Policy source directory not found: {policy_source_dir}")
     _ensure_policy_symlink(domino_root, policy_source_dir)
@@ -319,6 +333,16 @@ def main(cfg: DictConfig) -> None:
     _append_override(overrides, "text_cfg_scale", cfg.EVALUATION.text_cfg_scale)
     _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    _append_override(
+        overrides,
+        "action_source_hz",
+        cfg.EVALUATION.get("action_source_hz"),
+    )
+    _append_override(
+        overrides,
+        "action_target_hz",
+        cfg.EVALUATION.get("action_target_hz"),
+    )
     _append_override(
         overrides,
         "save_imagined_rollouts",
