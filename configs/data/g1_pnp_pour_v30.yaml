@@ -3,7 +3,7 @@ train:
   # LeRobot v3 aggregate Parquet/MP4 files are read directly; no episode split
   # or dataset conversion is required.
   dataset_dirs:
-    - /home/junjie.ye/Omni-G1/data/self_collected/g1_pnp_pour_v3
+    - /Omni-G1/data/self_collected/g1_pnp_pour_v3
   shape_meta:
     images:
       - key: egocentric
