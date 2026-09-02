@@ -29,7 +29,9 @@ train:
   # video interval keeps both observations and actions at 10 Hz.
   global_sample_stride: 1
   action_video_freq_ratio: 1
-  video_size: [240, 320]
+  # Wan VAE downsamples by 16 and the DiT patches latents by 2, so the final
+  # spatial dimensions must be divisible by 32. Crop native 240x320 to 224x320.
+  video_size: [224, 320]
   camera_key: null
   concat_multi_camera: null
   val_set_proportion: 0.0
