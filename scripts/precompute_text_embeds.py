@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import hydra
+import pandas as pd
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
@@ -111,30 +112,51 @@ def _resolve_context_len(context_lens: set[int]) -> int:
     return next(iter(context_lens))
 
 
+def _read_tasks(dataset_dir: Path) -> list[str]:
+    meta_dir = dataset_dir / "meta"
+    jsonl_path = meta_dir / "tasks.jsonl"
+    parquet_path = meta_dir / "tasks.parquet"
+
+    if jsonl_path.is_file():
+        tasks = []
+        with jsonl_path.open("r", encoding="utf-8") as file:
+            for line_idx, line in enumerate(file, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if "task" not in record:
+                    raise KeyError(f"Missing `task` field at {jsonl_path}:{line_idx}")
+                tasks.append(str(record["task"]))
+        return tasks
+
+    if parquet_path.is_file():
+        frame = pd.read_parquet(parquet_path)
+        if "task_index" not in frame.columns:
+            raise KeyError(f"Missing `task_index` column in {parquet_path}")
+        frame = frame.sort_values("task_index")
+        if "task" in frame.columns:
+            return [str(task) for task in frame["task"].tolist()]
+        return [str(task) for task in frame.index.tolist()]
+
+    raise FileNotFoundError(
+        f"Missing LeRobot task metadata under {meta_dir}; expected tasks.jsonl (v2.1) "
+        "or tasks.parquet (v3.0)."
+    )
+
+
 def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     prompts: list[str] = []
     seen = set()
     total_task_rows = 0
 
     for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
-
-        with tasks_path.open("r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
-                total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+        for task in _read_tasks(Path(ds_dir)):
+            prompt = DEFAULT_PROMPT.format(task=task)
+            total_task_rows += 1
+            if prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
@@ -201,7 +223,7 @@ def main(cfg: DictConfig):
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
         prompts = _read_unique_prompts(dataset_dirs)
     if not prompts:
-        logger.warning("No prompts found from tasks.jsonl; nothing to do.")
+        logger.warning("No prompts found in LeRobot task metadata; nothing to do.")
         return
 
     if torch.cuda.is_available():

@@ -26,6 +26,8 @@ from .text_cache import (
 logger = get_logger(__name__)
 
 class RobotVideoDataset(torch.utils.data.Dataset):
+    base_dataset_cls = BaseLerobotDataset
+
     def __init__(
         self,
         dataset_dirs,
@@ -49,6 +51,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         selected_task_data_mode: Literal["clean", "clean_and_randomized"] = "clean_and_randomized",
         task_text_embedding_cache_root: Optional[str] = None,
         expected_episodes_per_task: Optional[int] = None,
+        tolerance_s: Optional[float] = None,
+        video_backend: Optional[str] = None,
     ):
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
@@ -59,7 +63,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
         self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 
-        self.lerobot_dataset = BaseLerobotDataset(
+        self.lerobot_dataset = self.base_dataset_cls(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,
@@ -73,6 +77,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             text_embedding_context_len=context_len,
             expected_episodes_per_task=expected_episodes_per_task,
             image_sample_indices=self.video_sample_indices,
+            tolerance_s=tolerance_s,
+            video_backend=video_backend,
         )
 
         self.camera_key = camera_key

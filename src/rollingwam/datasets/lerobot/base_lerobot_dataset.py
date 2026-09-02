@@ -410,6 +410,9 @@ def _select_episode_indices(
 
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
+    metadata_cls = LeRobotDatasetMetadata
+    multi_dataset_cls = MultiLeRobotDataset
+
     def __init__(
         self,
         dataset_dirs: List[str],
@@ -434,6 +437,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # sampling
         global_sample_stride: int = 1,
         image_sample_indices: Optional[Sequence[int]] = None,
+        tolerance_s: Optional[float] = None,
+        video_backend: Optional[str] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -450,7 +455,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for ds_dir in dataset_dirs:
             ds_root = Path(ds_dir)
             repo_id = ds_dir
-            meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
+            meta = self.metadata_cls(repo_id=repo_id, root=ds_root)
             metas.append(meta)
 
         fps_list = [m.fps for m in metas]
@@ -544,10 +549,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 "training" if self.is_training_set else "validation",
             )
 
-        self.multi_dataset = MultiLeRobotDataset(
+        tolerances_s = None if tolerance_s is None else dict.fromkeys(self.dataset_dirs, tolerance_s)
+        self.multi_dataset = self.multi_dataset_cls(
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
+            tolerances_s=tolerances_s,
+            video_backend=video_backend,
         )
         
         # HACK: lerobot 3.0 will fix this

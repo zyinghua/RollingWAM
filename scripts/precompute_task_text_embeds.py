@@ -41,6 +41,7 @@ from rollingwam.datasets.lerobot.base_lerobot_dataset import (
     ROBOTWIN_FASTWAM_EPISODES_PER_TASK,
     ROBOTWIN_FASTWAM_TOTAL_EPISODES,
 )
+from rollingwam.datasets.lerobot3.lerobot_dataset import LeRobotDatasetMetadata as LeRobotV30Metadata
 from rollingwam.datasets.lerobot.text_cache import (
     DEFAULT_PROMPT,
     DEFAULT_TEXT_ENCODER_ID,
@@ -58,7 +59,7 @@ DEFAULT_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B"
 DEFAULT_TOKENIZER_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B"
 DEFAULT_BATCH_SIZE = 16
 MODES = ("list", "validate", "encode")
-REQUIRED_META_FILES = ("episodes.jsonl", "episodes_stats.jsonl", "tasks.jsonl")
+V21_META_FILES = ("episodes.jsonl", "episodes_stats.jsonl", "tasks.jsonl")
 # Templates overlap between related tasks, so a match must be strong and not a near-tie:
 # the true task's own templates generate its instructions, so a clearly lower runner-up is
 # evidence the winner is right, whereas a tie means the winner was picked arbitrarily.
@@ -122,16 +123,29 @@ def _flatten_numbers(value: Any) -> list[int]:
 
 
 def _load_archive(dataset_dir: Path):
-    """Read the metadata jsonl files directly: no video, no stats aggregation, no downloads."""
+    """Read local v2.1 or v3.0 metadata without decoding video or downloading files."""
     meta_root = dataset_dir / "meta"
-    episodes = {row["episode_index"]: row for row in _read_jsonl(meta_root / "episodes.jsonl")}
-    tasks_by_index = {
-        row["task_index"]: row["task"] for row in _read_jsonl(meta_root / "tasks.jsonl")
-    }
-    episode_stats = {
-        row["episode_index"]: row.get("stats", {})
-        for row in _read_jsonl(meta_root / "episodes_stats.jsonl")
-    }
+    if all((meta_root / name).is_file() for name in V21_META_FILES):
+        episodes = {
+            row["episode_index"]: row for row in _read_jsonl(meta_root / "episodes.jsonl")
+        }
+        tasks_by_index = {
+            row["task_index"]: row["task"] for row in _read_jsonl(meta_root / "tasks.jsonl")
+        }
+        episode_stats = {
+            row["episode_index"]: row.get("stats", {})
+            for row in _read_jsonl(meta_root / "episodes_stats.jsonl")
+        }
+    elif (meta_root / "tasks.parquet").is_file() and (meta_root / "episodes").is_dir():
+        metadata = LeRobotV30Metadata(repo_id=str(dataset_dir), root=dataset_dir)
+        episodes = metadata.episodes
+        tasks_by_index = metadata.tasks
+        episode_stats = metadata.episodes_stats
+    else:
+        raise FileNotFoundError(
+            f"Unsupported or incomplete LeRobot metadata under {meta_root}; expected the "
+            "v2.1 JSONL files or v3.0 tasks/episode parquet metadata."
+        )
     if len(episodes) != ROBOTWIN_FASTWAM_TOTAL_EPISODES:
         raise ValueError(
             "Per-task derivation requires the released RoboTwin layout with "
@@ -157,7 +171,7 @@ def _episode_instructions(
     if not isinstance(task_index_stats, dict):
         raise ValueError(
             f"Episode {episode_index} has no `task_index` statistics in "
-            "episodes_stats.jsonl; cannot resolve its instruction."
+            "episode metadata; cannot resolve its instruction."
         )
 
     low = _flatten_numbers(task_index_stats.get("min"))
@@ -169,7 +183,7 @@ def _episode_instructions(
     unknown = [index for index in indices if index not in tasks_by_index]
     if unknown:
         raise ValueError(
-            f"Episode {episode_index} references task indices absent from tasks.jsonl: {unknown[:5]}."
+            f"Episode {episode_index} references task indices absent from task metadata: {unknown[:5]}."
         )
     return {tasks_by_index[index] for index in indices}, len(indices) > 1
 
@@ -185,7 +199,7 @@ def _load_task_blocks(dataset_dir: Path) -> list[dict[str, Any]]:
         instructions: set[str] = set()
         for episode_index in range(start, start + ROBOTWIN_FASTWAM_EPISODES_PER_TASK):
             if episode_index not in episodes:
-                raise ValueError(f"Episode {episode_index} missing from episodes.jsonl.")
+                raise ValueError(f"Episode {episode_index} missing from episode metadata.")
             episode_instructions, spans_multiple = _episode_instructions(
                 episode_index, episode_stats, tasks_by_index
             )
@@ -536,10 +550,12 @@ def _resolve_dataset_dir(data_cfg: DictConfig) -> Path:
             f"archive), got {len(dataset_dirs)}."
         )
     dataset_dir = Path(str(dataset_dirs[0]))
-    missing = [name for name in REQUIRED_META_FILES if not (dataset_dir / "meta" / name).is_file()]
-    if missing:
+    meta_root = dataset_dir / "meta"
+    has_v21 = all((meta_root / name).is_file() for name in V21_META_FILES)
+    has_v30 = (meta_root / "tasks.parquet").is_file() and (meta_root / "episodes").is_dir()
+    if not has_v21 and not has_v30:
         raise FileNotFoundError(
-            f"Dataset metadata missing under {dataset_dir / 'meta'}: {missing}. "
+            f"No complete LeRobot v2.1 or v3.0 metadata found under {meta_root}. "
             "Check `data.train.dataset_dirs` and that the archive is mounted."
         )
     return dataset_dir
