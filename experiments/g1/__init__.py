@@ -1,1 +1,1 @@
-"""Unitree G1-specific training and deployment helpers."""
+"""Unitree G1 experiment configuration and action schema."""

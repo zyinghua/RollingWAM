@@ -1,4 +1,4 @@
-"""OmniRobot-compatible websocket transport for the stateful G1 policy."""
+"""WebSocket request/reply transport for policy inference."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ import websockets
 import websockets.asyncio.server as websocket_server
 import websockets.frames
 
-from experiments.g1 import msgpack_numpy
+from rollingwam.serving import msgpack_numpy
 
 logger = logging.getLogger(__name__)
 
 
-class G1WebsocketPolicyServer:
-    """Serve one stateful G1 policy using OmniRobot's native wire protocol.
+class WebsocketPolicyServer:
+    """Serve one stateful policy over binary MessagePack messages.
 
-    Metadata is sent immediately after connection. Each subsequent binary frame
-    is one MessagePack observation and receives one MessagePack action reply.
-    Only one client is allowed because RollingWAM carries a mutable rolling window.
+    Metadata is sent when a client connects. Each subsequent binary message
+    contains one observation and receives one inference result. A single active
+    client is enforced because the policy may carry state between requests.
     """
 
     def __init__(
@@ -52,12 +52,12 @@ class G1WebsocketPolicyServer:
             max_size=None,
             process_request=_health_check,
         ) as server:
-            logger.info("G1 policy server listening on ws://%s:%d", self._host, self._port)
+            logger.info("Policy server listening on ws://%s:%d", self._host, self._port)
             await server.serve_forever()
 
     async def _handler(self, websocket: websocket_server.ServerConnection) -> None:
         if self._client_active:
-            message = "Another G1 policy client is already active."
+            message = "Another policy client is already active."
             await websocket.send(message)
             await websocket.close(code=1013, reason=message)
             return
@@ -72,24 +72,24 @@ class G1WebsocketPolicyServer:
             while True:
                 raw = await websocket.recv()
                 if isinstance(raw, str):
-                    raise TypeError("G1 inference requests must be binary MessagePack frames.")
+                    raise TypeError("Inference requests must be binary MessagePack messages.")
                 observation = msgpack_numpy.unpackb(raw)
                 if not isinstance(observation, dict):
                     raise TypeError(
                         f"Decoded observation must be a dict, got {type(observation).__name__}."
                     )
-                action = self._policy.infer(observation)
-                await websocket.send(packer.pack(action))
+                result = self._policy.infer(observation)
+                await websocket.send(packer.pack(result))
         except websockets.ConnectionClosed:
             logger.info("Connection from %s closed", websocket.remote_address)
         except Exception:
             error = traceback.format_exc()
-            logger.error("Error during G1 inference:\n%s", error)
+            logger.error("Policy inference failed:\n%s", error)
             try:
                 await websocket.send(error)
                 await websocket.close(
                     code=websockets.frames.CloseCode.INTERNAL_ERROR,
-                    reason="Internal server error. Traceback included in previous frame.",
+                    reason="Internal server error. Traceback included in previous message.",
                 )
             except websockets.ConnectionClosed:
                 pass
@@ -98,7 +98,7 @@ class G1WebsocketPolicyServer:
             try:
                 self._policy.reset()
             except Exception:
-                logger.exception("Failed to reset G1 policy after client disconnect")
+                logger.exception("Failed to reset policy after client disconnect")
             self._client_active = False
 
 

@@ -1,21 +1,22 @@
-"""RollingWAM policy adapter for OmniRobot's native G1 websocket contract."""
+"""RollingWAM policy adapter for streaming observation-to-action inference."""
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as transforms_F
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
-from experiments.g1.action_layout import ACTION_DIM, STATE_DIM, split_action, validate_state
 from rollingwam.datasets.dataset_utils import (
     CenterCrop,
     Normalize,
@@ -27,14 +28,8 @@ from rollingwam.utils.config_resolvers import register_default_resolvers
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_ROOT = PROJECT_ROOT / "configs"
-
-DEFAULT_TASK_CONFIG = "g1_pnp_pour_rolling_1cam_320_1e-4"
-DEFAULT_EMBODIMENT = "unitree_g1_sonic"
-IMAGE_KEY = "ego_view"
-STATE_KEY = "state"
-ACTION_KEY = "action"
 
 register_default_resolvers()
 
@@ -85,7 +80,7 @@ def _compose_task_config(task_config: str) -> DictConfig:
 def _load_training_config(
     checkpoint_path: Path,
     config_path: str | None,
-    task_config: str,
+    task_config: str | None,
 ) -> tuple[DictConfig, Path | None]:
     if config_path:
         resolved = Path(config_path).expanduser().resolve()
@@ -97,6 +92,12 @@ def _load_training_config(
     if run_config is not None and run_config.is_file():
         return OmegaConf.load(run_config), run_config
 
+    if not task_config:
+        raise FileNotFoundError(
+            "Could not derive config.yaml from the checkpoint. Pass --config or "
+            "--task-config explicitly."
+        )
+
     logger.warning(
         "No config.yaml found above %s; composing current task config %s. "
         "Pass --config to avoid configuration drift.",
@@ -106,8 +107,8 @@ def _load_training_config(
     return _compose_task_config(task_config), None
 
 
-def _load_complete_g1_checkpoint(model: Any, checkpoint_path: Path) -> int | None:
-    """Strictly load a modern checkpoint; partial weights are unsafe on hardware."""
+def _load_inference_checkpoint(model: Any, checkpoint_path: Path) -> int | None:
+    """Load every model component required for action inference."""
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
         raise ValueError(f"Checkpoint payload must be a dict, got {type(payload).__name__}.")
@@ -116,11 +117,11 @@ def _load_complete_g1_checkpoint(model: Any, checkpoint_path: Path) -> int | Non
     missing = required - set(payload)
     if missing:
         raise ValueError(
-            "G1 real-robot serving requires a complete modern RollingWAM checkpoint; "
-            f"missing keys: {sorted(missing)}. Refusing to serve partially initialized weights."
+            "The checkpoint is missing components required for action inference: "
+            f"{sorted(missing)}."
         )
     if model.proprio_encoder is None:
-        raise ValueError("The configured G1 model has no proprio encoder.")
+        raise ValueError("The configured model has no proprio encoder.")
 
     rolling = payload["rolling"]
     expected_rolling_keys = set(model.ROLLING_KEYS)
@@ -151,13 +152,21 @@ def _load_complete_g1_checkpoint(model: Any, checkpoint_path: Path) -> int | Non
     return None if step is None else int(step)
 
 
-class RollingWAMG1Policy:
-    """Stateful one-observation-to-one-action-chunk G1 inference adapter.
+def _flat_dimension(raw_shape: Any, *, name: str) -> int:
+    if isinstance(raw_shape, int):
+        dimension = int(raw_shape)
+    else:
+        try:
+            dimension = math.prod(int(value) for value in raw_shape)
+        except TypeError as exc:
+            raise ValueError(f"{name} raw_shape must be an integer or a sequence.") from exc
+    if dimension < 1:
+        raise ValueError(f"{name} raw_shape must contain at least one value.")
+    return dimension
 
-    The returned 78-D action is kept in the dataset's native SONIC layout:
-    ``[motion token 64, left hand 7, right hand 7]``. Robot actuation and all
-    safety limits remain client-side.
-    """
+
+class RollingWAMPolicy:
+    """Serve image/state observations using the preprocessing saved with a checkpoint."""
 
     def __init__(
         self,
@@ -170,9 +179,13 @@ class RollingWAMG1Policy:
         negative_prompt: str = "",
         seed: int | None = None,
         compile_action_infer: bool = False,
-        embodiment: str = DEFAULT_EMBODIMENT,
+        embodiment: str = "default",
+        image_keys: Sequence[str] | None = None,
+        state_key: str | None = None,
+        action_key: str | None = None,
+        concat_multi_camera: str | None = None,
         default_instruction: str = "",
-        control_hz: float = 10.0,
+        fps: float,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -184,14 +197,14 @@ class RollingWAMG1Policy:
         self.compile_action_infer = bool(compile_action_infer)
         self.embodiment = str(embodiment)
         self.default_instruction = str(default_instruction)
-        self.control_hz = float(control_hz)
+        self.fps = float(fps)
         self._lock = threading.RLock()
         self._active_instruction: str | None = None
 
         if len(self.video_size) != 2 or min(self.video_size) < 1:
             raise ValueError(f"video_size must be positive [H,W], got {self.video_size}.")
-        if self.control_hz <= 0:
-            raise ValueError(f"control_hz must be positive, got {self.control_hz}.")
+        if self.fps <= 0:
+            raise ValueError(f"fps must be positive, got {self.fps}.")
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be positive.")
         if self.num_inference_steps % int(self.model.window_blocks) != 0:
@@ -201,34 +214,74 @@ class RollingWAMG1Policy:
             )
         if int(self.model.actions_per_chunk) < 1:
             raise ValueError("Checkpoint actions_per_chunk must be positive.")
-        if int(self.model.action_expert.action_dim) != ACTION_DIM:
-            raise ValueError(
-                f"G1 requires a {ACTION_DIM}D action model, got "
-                f"{self.model.action_expert.action_dim}."
-            )
-        if self.model.proprio_dim is None or int(self.model.proprio_dim) != STATE_DIM:
-            raise ValueError(
-                f"G1 requires a {STATE_DIM}D proprio encoder, got {self.model.proprio_dim}."
-            )
         if self.processor.action_state_transforms is not None:
             raise ValueError(
-                "The G1 serving adapter currently requires action_state_transforms=null, "
-                "matching the G1 training config."
+                "This policy requires action_state_transforms=null; transformed action/state "
+                "spaces are not supported for streaming inference."
             )
 
         image_meta = self.processor.shape_meta["images"]
         state_meta = self.processor.shape_meta["state"]
         action_meta = self.processor.shape_meta["action"]
-        if len(image_meta) != 1 or len(state_meta) != 1 or len(action_meta) != 1:
-            raise ValueError("G1 serving requires exactly one image, state, and action field.")
-        if int(state_meta[0]["raw_shape"]) != STATE_DIM:
-            raise ValueError("Processor G1 state metadata does not describe 43 raw values.")
-        if int(action_meta[0]["raw_shape"]) != ACTION_DIM:
-            raise ValueError("Processor G1 action metadata does not describe 78 raw values.")
+        if not image_meta:
+            raise ValueError("Streaming inference requires at least one image field.")
+        if len(state_meta) != 1 or len(action_meta) != 1:
+            raise ValueError("Streaming inference requires exactly one state and one action field.")
+        if int(self.processor.num_output_cameras) != len(image_meta):
+            raise ValueError(
+                f"Processor num_output_cameras={self.processor.num_output_cameras} does not match "
+                f"the {len(image_meta)} configured image fields."
+            )
 
-        self._image_meta = image_meta[0]
+        self._image_meta = list(image_meta)
         self._state_meta = state_meta[0]
         self._action_meta = action_meta[0]
+        self.state_dim = _flat_dimension(self._state_meta["raw_shape"], name="state")
+        self.action_dim = _flat_dimension(self._action_meta["raw_shape"], name="action")
+        if int(self.model.action_expert.action_dim) != self.action_dim:
+            raise ValueError(
+                f"Model action dimension {self.model.action_expert.action_dim} does not match "
+                f"processor dimension {self.action_dim}."
+            )
+        if self.model.proprio_dim is None or int(self.model.proprio_dim) != self.state_dim:
+            raise ValueError(
+                f"Model proprio dimension {self.model.proprio_dim} does not match processor "
+                f"dimension {self.state_dim}."
+            )
+        if isinstance(image_keys, str):
+            image_keys = [image_keys]
+        if image_keys is None:
+            image_keys = [str(meta["key"]) for meta in self._image_meta]
+        self.image_keys = tuple(str(key) for key in image_keys)
+        if len(self.image_keys) != len(self._image_meta):
+            raise ValueError(
+                f"Expected {len(self._image_meta)} request image keys, got {len(self.image_keys)}."
+            )
+        self.state_key = str(state_key or self._state_meta["key"])
+        self.action_key = str(action_key or self._action_meta["key"])
+        self.concat_multi_camera = (
+            None if concat_multi_camera is None else str(concat_multi_camera).strip().lower()
+        )
+        for name, key in (
+            ("state_key", self.state_key),
+            ("action_key", self.action_key),
+            ("embodiment", self.embodiment),
+        ):
+            if not key.strip():
+                raise ValueError(f"{name} must not be empty.")
+        if any(not key.strip() for key in self.image_keys):
+            raise ValueError("Request image keys must not be empty.")
+        if len(set(self.image_keys)) != len(self.image_keys):
+            raise ValueError(f"Request image keys must be unique, got {self.image_keys}.")
+        if len(self.image_keys) > 1 and self.concat_multi_camera not in {
+            "horizontal",
+            "vertical",
+            "robotwin",
+        }:
+            raise ValueError(
+                "Multiple image fields require concat_multi_camera to be horizontal, "
+                "vertical, or robotwin."
+            )
         self._final_resize = ResizeSmallestSideAspectPreserving(
             args={"img_h": self.video_size[0], "img_w": self.video_size[1]}
         )
@@ -245,7 +298,7 @@ class RollingWAMG1Policy:
         *,
         dataset_stats_path: str | None = None,
         config_path: str | None = None,
-        task_config: str = DEFAULT_TASK_CONFIG,
+        task_config: str | None = None,
         device: str = "cuda",
         mixed_precision: str = "bf16",
         num_inference_steps: int = 10,
@@ -255,10 +308,13 @@ class RollingWAMG1Policy:
         compile_action_infer: bool = False,
         compile_vae_encode: bool = False,
         vae_encode_batch_size: int = 1,
-        embodiment: str = DEFAULT_EMBODIMENT,
+        embodiment: str = "default",
+        image_keys: Sequence[str] | None = None,
+        state_key: str | None = None,
+        action_key: str | None = None,
         default_instruction: str = "",
-        control_hz: float = 10.0,
-    ) -> "RollingWAMG1Policy":
+        fps: float,
+    ) -> "RollingWAMPolicy":
         checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"RollingWAM checkpoint not found: {checkpoint}")
@@ -280,7 +336,7 @@ class RollingWAMG1Policy:
             model_dtype=_model_dtype(mixed_precision),
             device=device,
         )
-        checkpoint_step = _load_complete_g1_checkpoint(model, checkpoint)
+        checkpoint_step = _load_inference_checkpoint(model, checkpoint)
         model = model.to(device).eval()
 
         processor_cfg = OmegaConf.create(
@@ -290,7 +346,7 @@ class RollingWAMG1Policy:
         processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(stats_path)))
 
         logger.info(
-            "Loaded G1 RollingWAM | checkpoint=%s | step=%s | config=%s | stats=%s",
+            "Loaded RollingWAM policy | checkpoint=%s | step=%s | config=%s | stats=%s",
             checkpoint,
             checkpoint_step,
             loaded_config or f"task:{task_config}",
@@ -306,39 +362,101 @@ class RollingWAMG1Policy:
             seed=seed,
             compile_action_infer=compile_action_infer,
             embodiment=embodiment,
+            image_keys=image_keys,
+            state_key=state_key,
+            action_key=action_key,
+            concat_multi_camera=cfg.data.train.get("concat_multi_camera"),
             default_instruction=default_instruction,
-            control_hz=control_hz,
+            fps=fps,
         )
 
-    def _preprocess_image(self, image: Any) -> torch.Tensor:
+    def _preprocess_image(
+        self,
+        image: Any,
+        *,
+        request_key: str,
+        image_meta: Mapping[str, Any],
+    ) -> torch.Tensor:
         image_np = np.asarray(image)
         if image_np.dtype != np.uint8:
-            raise TypeError(f"{IMAGE_KEY} must be uint8 RGB, got {image_np.dtype}.")
+            raise TypeError(f"{request_key} must be uint8 RGB, got {image_np.dtype}.")
         if image_np.ndim != 3 or image_np.shape[-1] != 3:
             raise ValueError(
-                f"{IMAGE_KEY} must be HWC RGB with shape [H,W,3], got {image_np.shape}."
+                f"{request_key} must be HWC RGB with shape [H,W,3], got {image_np.shape}."
             )
 
         frame = torch.from_numpy(np.ascontiguousarray(image_np)).permute(2, 0, 1).unsqueeze(0)
         transforms = self.processor.val_transforms
         if isinstance(transforms, Mapping):
-            transforms = transforms[self._image_meta["key"]]
+            transforms = transforms[image_meta["key"]]
         if transforms is not None:
             for transform in transforms:
                 frame = transform(frame)
 
-        expected = (1, *tuple(int(v) for v in self._image_meta["shape"]))
+        expected = (1, *tuple(int(v) for v in image_meta["shape"]))
         if tuple(frame.shape) != expected:
             raise ValueError(
-                f"Configured G1 image transforms must produce {expected}, got {tuple(frame.shape)}."
+                f"Configured transforms for {request_key} must produce {expected}, "
+                f"got {tuple(frame.shape)}."
+            )
+        return frame
+
+    def _compose_image_views(self, frames: Sequence[torch.Tensor]) -> torch.Tensor:
+        if len(frames) == 1:
+            return frames[0]
+        if self.concat_multi_camera == "horizontal":
+            return torch.cat(list(frames), dim=-1)
+        if self.concat_multi_camera == "vertical":
+            return torch.cat(list(frames), dim=-2)
+        if self.concat_multi_camera == "robotwin":
+            if len(frames) != 3:
+                raise ValueError(
+                    "concat_multi_camera='robotwin' requires exactly three image fields."
+                )
+            top = transforms_F.resize(
+                frames[0],
+                size=[256, 320],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            lower_left = transforms_F.resize(
+                frames[1],
+                size=[128, 160],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            lower_right = transforms_F.resize(
+                frames[2],
+                size=[128, 160],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            lower = torch.cat([lower_left, lower_right], dim=-1)
+            return torch.cat([top, lower], dim=-2)
+        raise ValueError(f"Unsupported camera concatenation mode: {self.concat_multi_camera!r}.")
+
+    def _preprocess_images(self, images: Any) -> torch.Tensor:
+        if not isinstance(images, Mapping):
+            raise TypeError(f"images must be a mapping, got {type(images).__name__}.")
+        frames = []
+        for request_key, image_meta in zip(self.image_keys, self._image_meta, strict=True):
+            if request_key not in images:
+                raise KeyError(f"Observation is missing images.{request_key}.")
+            frames.append(
+                self._preprocess_image(
+                    images[request_key],
+                    request_key=request_key,
+                    image_meta=image_meta,
+                )
             )
 
+        frame = self._compose_image_views(frames)
         frame = self._final_resize(frame)
         frame = self._final_crop(frame)
         frame = self._final_normalize(frame)
         if tuple(frame.shape) != (1, 3, *self.video_size):
             raise ValueError(
-                f"Final G1 frame must be [1,3,{self.video_size[0]},{self.video_size[1]}], "
+                f"Final frame must be [1,3,{self.video_size[0]},{self.video_size[1]}], "
                 f"got {tuple(frame.shape)}."
             )
         return frame.unsqueeze(2).to(
@@ -348,11 +466,12 @@ class RollingWAMG1Policy:
 
     def _normalize_state(self, state: Any) -> torch.Tensor:
         state_np = np.asarray(state, dtype=np.float32)
-        validate_state(state_np)
-        if state_np.ndim != 1:
-            raise ValueError(f"{STATE_KEY} must have shape [{STATE_DIM}], got {state_np.shape}.")
+        if state_np.ndim != 1 or state_np.shape[0] != self.state_dim:
+            raise ValueError(
+                f"{self.state_key} must have shape [{self.state_dim}], got {state_np.shape}."
+            )
         if not np.isfinite(state_np).all():
-            raise ValueError(f"{STATE_KEY} contains non-finite values.")
+            raise ValueError(f"{self.state_key} contains non-finite values.")
 
         key = self._state_meta["key"]
         batch = {
@@ -367,20 +486,19 @@ class RollingWAMG1Policy:
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
         if action.ndim != 2 or tuple(action.shape) != (
             int(self.model.actions_per_chunk),
-            ACTION_DIM,
+            self.action_dim,
         ):
             raise ValueError(
                 "Model action must have shape "
-                f"[{self.model.actions_per_chunk},{ACTION_DIM}], got {tuple(action.shape)}."
+                f"[{self.model.actions_per_chunk},{self.action_dim}], got {tuple(action.shape)}."
             )
         key = self._action_meta["key"]
         normalizer = self.processor.normalizer.normalizers["action"][key]
         action_np = normalizer.backward(
             action.unsqueeze(0).to(device="cpu", dtype=torch.float32)
         )[0].numpy()
-        split_action(action_np)
         if not np.isfinite(action_np).all():
-            raise ValueError("Model produced non-finite G1 actions.")
+            raise ValueError("Model produced non-finite actions.")
         return np.asarray(action_np, dtype=np.float32)
 
     def _resolve_instruction(self, obs: Mapping[str, Any]) -> str:
@@ -406,17 +524,17 @@ class RollingWAMG1Policy:
 
     @torch.inference_mode()
     def infer(self, obs: Mapping[str, Any]) -> dict[str, np.ndarray]:
-        """Infer one native 4x78 G1 action chunk from one latest observation."""
+        """Infer one action chunk from the latest observation."""
         if not isinstance(obs, Mapping):
             raise TypeError(f"Observation must be a mapping, got {type(obs).__name__}.")
         with self._lock:
             self._validate_embodiment(obs)
             try:
-                image = obs["images"][IMAGE_KEY]
-                state = obs["states"][STATE_KEY]
+                images = obs["images"]
+                state = obs["states"][self.state_key]
             except (KeyError, TypeError) as exc:
                 raise KeyError(
-                    f"Observation must contain images.{IMAGE_KEY} and states.{STATE_KEY}."
+                    f"Observation must contain images and states.{self.state_key}."
                 ) from exc
 
             instruction = self._resolve_instruction(obs)
@@ -424,7 +542,7 @@ class RollingWAMG1Policy:
                 logger.info("Instruction changed; resetting RollingWAM stream state.")
                 self._reset_unlocked()
 
-            new_frames = self._preprocess_image(image)
+            new_frames = self._preprocess_images(images)
             proprio = self._normalize_state(state)
             prompt = DEFAULT_PROMPT.format(task=instruction)
             prediction = self.model.rolling_act(
@@ -438,7 +556,7 @@ class RollingWAMG1Policy:
                 compile_action_infer=self.compile_action_infer,
             )
             self._active_instruction = instruction
-            return {ACTION_KEY: self._denormalize_action(prediction["action"])}
+            return {self.action_key: self._denormalize_action(prediction["action"])}
 
     def _reset_unlocked(self) -> None:
         self.model.rolling_reset()
@@ -454,9 +572,9 @@ class RollingWAMG1Policy:
         return {
             "embodiments": {
                 self.embodiment: {
-                    "image_keys": [IMAGE_KEY],
-                    "state_keys": {STATE_KEY: STATE_DIM},
-                    "action_keys": {ACTION_KEY: ACTION_DIM},
+                    "image_keys": list(self.image_keys),
+                    "state_keys": {self.state_key: self.state_dim},
+                    "action_keys": {self.action_key: self.action_dim},
                     "action_horizon": horizon,
                 }
             },
@@ -469,7 +587,7 @@ class RollingWAMG1Policy:
                 "space": "unnormalized",
             },
             "control": {
-                "fps": self.control_hz,
+                "fps": self.fps,
                 "execute_horizon": horizon,
                 "replan_after_actions": horizon,
             },

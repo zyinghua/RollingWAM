@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve a trained G1 RollingWAM over OmniRobot's native websocket protocol."""
+"""Serve a trained RollingWAM policy over WebSocket."""
 
 from __future__ import annotations
 
@@ -10,24 +10,18 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 for path in (str(PROJECT_ROOT), str(SRC_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from experiments.g1.rollingwam_policy import (  # noqa: E402
-    DEFAULT_EMBODIMENT,
-    DEFAULT_TASK_CONFIG,
-    RollingWAMG1Policy,
-)
-from experiments.g1.websocket_server import G1WebsocketPolicyServer  # noqa: E402
+from rollingwam.serving.rollingwam_policy import RollingWAMPolicy  # noqa: E402
+from rollingwam.serving.websocket_policy_server import WebsocketPolicyServer  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Serve a G1 RollingWAM checkpoint over an OmniRobot-compatible websocket."
-    )
+    parser = argparse.ArgumentParser(description="Serve a RollingWAM checkpoint over WebSocket.")
     parser.add_argument(
         "--checkpoint",
         required=True,
@@ -45,13 +39,32 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task-config",
-        default=DEFAULT_TASK_CONFIG,
+        default=None,
         help="Fallback Hydra task config when no run config.yaml is available.",
     )
     parser.add_argument(
         "--embodiment",
-        default=DEFAULT_EMBODIMENT,
-        help="Embodiment tag advertised to OmniRobot clients.",
+        default="default",
+        help="Embodiment identifier advertised to clients.",
+    )
+    parser.add_argument(
+        "--image-key",
+        action="append",
+        default=None,
+        help=(
+            "Request image key in processor camera order. Repeat for multiple cameras; "
+            "defaults to the processor's configured keys."
+        ),
+    )
+    parser.add_argument(
+        "--state-key",
+        default=None,
+        help="Request state key. Defaults to the processor's configured state key.",
+    )
+    parser.add_argument(
+        "--action-key",
+        default=None,
+        help="Response action key. Defaults to the processor's configured action key.",
     )
     parser.add_argument(
         "--num-steps",
@@ -68,12 +81,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
-        "--transport",
-        choices=("websocket",),
-        default="websocket",
-        help="G1 uses OmniRobot's native websocket transport.",
+        "--fps",
+        type=float,
+        required=True,
+        help="Action execution frequency advertised to clients.",
     )
-    parser.add_argument("--control-hz", "--fps", dest="control_hz", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--text-cfg-scale", type=float, default=1.0)
     parser.add_argument("--negative-prompt", default="")
@@ -95,7 +107,7 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    policy = RollingWAMG1Policy.from_checkpoint(
+    policy = RollingWAMPolicy.from_checkpoint(
         args.checkpoint,
         dataset_stats_path=args.dataset_stats,
         config_path=args.config,
@@ -110,10 +122,13 @@ def main() -> None:
         compile_vae_encode=args.compile_vae_encode,
         vae_encode_batch_size=args.vae_encode_batch_size,
         embodiment=args.embodiment,
+        image_keys=args.image_key,
+        state_key=args.state_key,
+        action_key=args.action_key,
         default_instruction=args.default_instruction,
-        control_hz=args.control_hz,
+        fps=args.fps,
     )
-    server = G1WebsocketPolicyServer(
+    server = WebsocketPolicyServer(
         policy,
         host=args.host,
         port=args.port,

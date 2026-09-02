@@ -1,4 +1,4 @@
-"""NumPy-safe MessagePack codec compatible with OmniRobot's websocket client."""
+"""MessagePack serialization for NumPy arrays and scalars."""
 
 from __future__ import annotations
 

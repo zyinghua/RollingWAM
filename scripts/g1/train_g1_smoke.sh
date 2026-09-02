@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Train RollingWAM on both tasks in the Unitree G1 LeRobot v3 dataset.
 # Usage:
-#   bash scripts/g1/train_g1_rolling.sh [num_gpus] [hydra_overrides...]
+#   bash scripts/g1/train_g1_smoke.sh [num_gpus] [hydra_overrides...]
 
 set -euo pipefail
 

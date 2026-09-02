@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Precompute the two G1 dataset task prompts before the training smoke test.
+# Precompute task-instruction embeddings for the configured G1 dataset.
 # Usage:
 #   bash scripts/g1/precompute_g1_text_embeds.sh [num_gpus] [hydra_overrides...]
 
