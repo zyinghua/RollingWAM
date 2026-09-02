@@ -21,5 +21,5 @@ PYTHONDONTWRITEBYTECODE=1 \
 DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-${REPO_ROOT}/checkpoints}" \
 DIFFSYNTH_SKIP_DOWNLOAD="${DIFFSYNTH_SKIP_DOWNLOAD:-true}" \
 torchrun --standalone --nproc_per_node="$NPROC" scripts/precompute_text_embeds.py \
-  task=g1_pnp_pour_rolling_1cam_320_smoke \
+  task=g1_pnp_pour_rolling_1cam_320_1e-4 \
   "$@"

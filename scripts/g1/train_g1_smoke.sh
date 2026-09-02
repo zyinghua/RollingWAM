@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run two optimizer steps over the G1 LeRobot v3 dataset with no evaluation.
+# Train RollingWAM on both tasks in the Unitree G1 LeRobot v3 dataset.
 # Usage:
-#   bash scripts/g1/train_g1_smoke.sh [num_gpus] [hydra_overrides...]
+#   bash scripts/g1/train_g1_rolling.sh [num_gpus] [hydra_overrides...]
 
 set -euo pipefail
 
@@ -30,5 +30,5 @@ PYTHONDONTWRITEBYTECODE=1 \
 DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-${REPO_ROOT}/checkpoints}" \
 DIFFSYNTH_SKIP_DOWNLOAD="${DIFFSYNTH_SKIP_DOWNLOAD:-true}" \
 bash scripts/train_zero2.sh "$NPROC" \
-  task=g1_pnp_pour_rolling_1cam_320_smoke \
+  task=g1_pnp_pour_rolling_1cam_320_1e-4 \
   "$@"
