@@ -24,9 +24,8 @@ train:
         raw_shape: 78
         shape: 78
 
-  num_frames: 5
-  # The dataset is native 10 Hz. Sampling every row and using one action per
-  # video interval keeps both observations and actions at 10 Hz.
+  num_frames: 49
+  # Sample consecutive observations and align one action with each video interval.
   global_sample_stride: 1
   action_video_freq_ratio: 1
   # Wan VAE downsamples by 16 and the DiT patches latents by 2, so the final

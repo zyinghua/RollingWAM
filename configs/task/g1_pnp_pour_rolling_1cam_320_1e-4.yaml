@@ -11,12 +11,12 @@ num_workers: 4
 model:
   mot_checkpoint_mixed_attn: true
   rolling:
-    window_blocks: 5
-    chunk_latents: 1
+    window_blocks: 3
+    chunk_latents: 4
 
 data:
   train:
-    # Native 10 Hz: 20 actions and 21 observations over 2.0 seconds.
+    # Derive the sequence length from the temporal and rolling-window geometry.
     num_frames: ${eval:'${data.train.action_video_freq_ratio} * 4 * ${model.rolling.chunk_latents} * ${model.rolling.window_blocks} + 1'}
   val: null
 
