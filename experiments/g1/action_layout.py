@@ -1,8 +1,8 @@
-"""G1 state/action layout shared with a future real-robot deployment adapter.
+"""G1 state/action layout shared by training and real-robot deployment.
 
 Training treats the complete 78D action as a continuous normalized target. This
-module only records and checks the semantic layout; SONIC transport belongs in
-the eventual G1 deployment policy.
+module records and checks the semantic layout. The model server returns it
+unchanged; SONIC controller transport and actuation remain robot-side.
 """
 
 from typing import Any, NamedTuple
