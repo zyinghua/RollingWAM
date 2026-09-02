@@ -1,0 +1,66 @@
+train:
+  _target_: rollingwam.datasets.lerobot3.robot_video_dataset.RobotVideoDataset
+  # LeRobot v3 aggregate Parquet/MP4 files are read directly; no episode split
+  # or dataset conversion is required.
+  dataset_dirs:
+    - /home/junjie.ye/Omni-G1/data/self_collected/g1_pnp_pour_v3
+  shape_meta:
+    images:
+      - key: egocentric
+        lerobot_key: observation.images.egocentric
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+    state:
+      # Keep RollingWAM's logical `default` state while reading G1's raw
+      # LeRobot column named `states`. The processor returns it as `proprio`.
+      - key: default
+        lerobot_key: states
+        raw_shape: 43
+        shape: 43
+    action:
+      # [motion token 64, left hand 7, right hand 7]
+      - key: default
+        lerobot_key: action
+        raw_shape: 78
+        shape: 78
+
+  num_frames: 5
+  # The dataset is native 10 Hz. Sampling every row and using one action per
+  # video interval keeps both observations and actions at 10 Hz.
+  global_sample_stride: 1
+  action_video_freq_ratio: 1
+  video_size: [240, 320]
+  camera_key: null
+  concat_multi_camera: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  pretrained_norm_stats: null
+  skip_padding_as_possible: false
+
+  processor:
+    _target_: rollingwam.datasets.lerobot.processors.rollingwam_processor.RollingWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 1
+    action_output_dim: 78
+    proprio_output_dim: 43
+    delta_action_dim_mask: null
+    action_state_transforms: null
+    use_stepwise_action_norm: false
+    norm_default_mode: min/max
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: rollingwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      - _target_: rollingwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+    val_transforms:
+      - _target_: rollingwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+
+  # Keep generated cache artifacts outside the read-only source dataset.
+  text_embedding_cache_dir: /workspace/RollingWAM/artifacts/g1_pnp_pour_v3/text_embeds_cache
+  context_len: 128
+  video_backend: pyav

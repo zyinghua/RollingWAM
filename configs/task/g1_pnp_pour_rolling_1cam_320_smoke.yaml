@@ -1,0 +1,37 @@
+# @package _global_
+
+defaults:
+  - override /data: g1_pnp_pour_v30
+  - override /model: rollingwam
+  - _self_
+
+# Minimal end-to-end training smoke test.
+batch_size: 1
+num_workers: 0
+
+model:
+  rolling:
+    window_blocks: 1
+    chunk_latents: 1
+
+data:
+  train:
+    # 10 Hz: 4 actions and 5 observations, covering 0.4 seconds.
+    num_frames: ${eval:'${data.train.action_video_freq_ratio} * 4 * ${model.rolling.chunk_latents} * ${model.rolling.window_blocks} + 1'}
+  val: null
+
+lr_scheduler_type: cosine
+learning_rate: 1e-4
+num_epochs: 1
+max_steps: 2
+log_every: 1
+save_every: 0
+eval_every: 0
+eval_num_inference_steps: 10
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+
+wandb:
+  enabled: false
