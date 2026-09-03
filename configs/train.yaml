@@ -22,6 +22,10 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10  # must be divisible by model.rolling.window_blocks
+# Run one eval before step 1 as a smoke test of the eval path (ffmpeg fork,
+# cross-rank gather, VAE decode). Costs ~one eval; catches eval bugs in minutes
+# instead of at the first eval_every boundary hours in.
+eval_at_start: true
 
 # training
 gradient_accumulation_steps: 1

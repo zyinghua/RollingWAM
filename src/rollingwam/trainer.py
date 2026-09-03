@@ -578,20 +578,31 @@ class Wan22Trainer:
         psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
         ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
 
-        stitched_video_tensor = torch.cat(
-            [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-            dim=2,
-        ).contiguous()
-        stitched_frames = []
-        for t in range(stitched_video_tensor.shape[1]):
-            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-            stitched_frames.append(Image.fromarray(frame))
+        # Only the main process writes the eval video. save_mp4 shells out to
+        # ffmpeg through fork+exec, and every rank doing that at once exhausted
+        # host memory on a 4-node run: the first eval (step 500) died with
+        # OSError: [Errno 12] Cannot allocate memory on two of the four nodes,
+        # after 13.5h of healthy training. The metrics gather below still runs on
+        # every rank, so this guard must stay inside evaluate(), not around it.
+        # video_path is initialised here because the returned `result` dict reads
+        # it on EVERY rank; leaving it defined only inside the guard raised
+        # UnboundLocalError on the non-main ranks at the first eval.
+        video_path = None
+        if self.accelerator.is_main_process:
+            stitched_video_tensor = torch.cat(
+                [pred_video_tensor, vae_video_tensor, gt_video_tensor],
+                dim=2,
+            ).contiguous()
+            stitched_frames = []
+            for t in range(stitched_video_tensor.shape[1]):
+                frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+                stitched_frames.append(Image.fromarray(frame))
 
-        video_path = os.path.join(
-            self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
-        )
-        save_mp4(stitched_frames, video_path, fps=8)
+            video_path = os.path.join(
+                self.eval_dir,
+                f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            )
+            save_mp4(stitched_frames, video_path, fps=8)
 
         local_metrics = torch.tensor(
             [
@@ -768,6 +779,24 @@ class Wan22Trainer:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
+
+        # Smoke-test the eval path before committing hours to training. evaluate()
+        # exercises the most failure-prone code here — an ffmpeg fork, a
+        # cross-rank gather, and a VAE decode — none of which a plain training
+        # step touches. A bug there otherwise only surfaces at the first
+        # eval_every boundary: one such bug cost 2.6h of 4-node time and left no
+        # checkpoint, because eval runs before save at the same step. The metrics
+        # are meaningless on an untrained model; failing fast is the point.
+        # Runs on EVERY rank: evaluate() contains a collective.
+        if getattr(self.cfg, "eval_at_start", True) and self.eval_every > 0 and self.val_dataset is not None:
+            logger.info("Running start-of-training eval (smoke test) at step=%d.", self.global_step)
+            start_metrics = self.evaluate()
+            if start_metrics is not None and self.accelerator.is_main_process:
+                logger.info(
+                    "[eval@start] step=%d val_loss=%.4f infer_psnr=%.4f",
+                    self.global_step, start_metrics["val_loss"], start_metrics["psnr_rd"],
+                )
+
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
