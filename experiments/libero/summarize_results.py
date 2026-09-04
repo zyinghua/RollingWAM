@@ -27,7 +27,7 @@ def format_time(seconds):
         remaining_seconds = remaining % 60
         return f"{hours:02d}h{minutes:02d}m{remaining_seconds:02d}s"
 
-def summarize_results(output_dir):
+def summarize_results(output_dir, *, ckpt=None, config=None):
     """Summarize all evaluation results.
 
     Args:
@@ -194,7 +194,7 @@ def summarize_results(output_dir):
     df = pd.DataFrame(df_data)
     
     # Use the last checkpoint path component as the title
-    ckpt_path = os.environ.get('CKPT', '')
+    ckpt_path = ckpt if ckpt is not None else os.environ.get('CKPT', '')
     title = os.path.basename(ckpt_path) if ckpt_path else 'Results'
     
     # Transpose the DataFrame and use Task Suite as column names
@@ -272,8 +272,8 @@ def summarize_results(output_dir):
     with open(summary_file, 'w') as f:
         json.dump({
             'run_id': os.path.basename(output_dir),
-            'ckpt': os.environ.get('CKPT', ''), # Checkpoint path
-            'config': os.environ.get('CONFIG', ''), # Config path
+            'ckpt': ckpt if ckpt is not None else os.environ.get('CKPT', ''),
+            'config': config if config is not None else os.environ.get('CONFIG', ''),
             'suite_stats': suite_stats_output,
             'task_results': task_results,
             'overall': overall_stats
