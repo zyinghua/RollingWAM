@@ -72,6 +72,14 @@ QUEUE_MAP = {
     ("vla", "vla-p5"):                          ("fss-vla-p5-48xlarge-us-west-2",              "p5"),
     ("vla-p5en",):                              ("fss-vla-p5en-48xlarge-us-west-2",            "p5en"),
     ("cv", "cv-wfm", "cv-p5en", "cv-wfm-p5en"): ("fss-cv-wfm-p5en-48xlarge-us-west-2",         "p5en"),
+    # ad2 account. Its service environment ad2-wfm-us-west-2 reserves
+    # 16 x ml.p5en.48xlarge and sits completely idle (0 running, 0 queued), but
+    # RoboticsWFM-BatchOperator is NOT authorized on it: submitting fails with
+    # "no identity-based policy allows the batch:SubmitServiceJob action" — a
+    # missing grant, unlike the tag-conditioned SCP deny on fss-cv-wfm-p5en, so
+    # no amount of tagging helps. The alias is kept so it works the moment the
+    # any4d owners grant access; ask them before assuming their reservation.
+    ("any4d",):                                 ("any4d-training-queue",                       "p5en"),
     # Spot FSS queues (robotics-old / 124224456861 only). Submit with --spot.
     ("cv-spot", "cv-wfm-spot-p5en"):            ("fss-cv-wfm-spot-p5en-48xlarge-us-west-2",    "p5en"),
     ("cv-spot-p5", "cv-wfm-spot-p5"):           ("fss-cv-wfm-spot-p5-48xlarge-us-west-2",      "p5"),
@@ -119,11 +127,15 @@ except ImportError:
     _HAS_QUEUE = False
 
 
+def tag_map() -> dict[str, str]:
+    return {
+        "tri.project":     os.environ.get("TRI_PROJECT", "MM:PJ-0077"),
+        "tri.owner.email": os.environ.get("TRI_OWNER_EMAIL", "CHANGE.ME@tri.global"),
+    }
+
+
 def tags() -> list[dict]:
-    return [
-        {"Key": "tri.project",     "Value": os.environ.get("TRI_PROJECT", "MM:PJ-0077")},
-        {"Key": "tri.owner.email", "Value": os.environ.get("TRI_OWNER_EMAIL", "CHANGE.ME@tri.global")},
-    ]
+    return [{"Key": k, "Value": v} for k, v in tag_map().items()]
 
 
 def run_command(command: str) -> None:
@@ -408,13 +420,32 @@ def main() -> None:
         from sagemaker.aws_batch.training_queue import TrainingQueue as Queue
 
         os.environ["AWS_DEFAULT_REGION"] = args.region
-        os.environ.setdefault("AWS_PROFILE", profile)
+        # TrainingQueue takes no session: its submit_service_job call goes
+        # through get_batch_boto_client(), i.e. boto3's DEFAULT session. That
+        # session is built lazily and then cached, and the SageMaker Session
+        # above already materialised it — so setting AWS_PROFILE here is too
+        # late, and setdefault() would not override an ambient value anyway.
+        # Submitting as robotics-old while passing the ad2 execution role failed
+        # with "Cross-account pass role is not allowed". Rebuild the default
+        # session explicitly so Batch is called as the target account.
+        os.environ["AWS_PROFILE"] = profile
+        boto3.setup_default_session(profile_name=profile, region_name=args.region)
         print(f"Submitting via Batch queue: {queue_name}")
         queued = Queue(queue_name).map(
             estimator, inputs=[fit_inputs or None], job_names=[job_name],
             priority=args.priority,
             share_identifier=os.environ.get("SM_FSS_IDENTIFIER", "default"),
             timeout={"attemptDurationSeconds": max_run},
+            # Batch-level tags, distinct from the estimator's SageMaker tags
+            # above. The ad2 account (385697366450) carries an Organizations SCP
+            # that denies batch:SubmitServiceJob unless the *Batch* request
+            # carries both tri.owner.email and tri.project — estimator tags ride
+            # in the SageMaker payload and are invisible to that check, so
+            # omitting this made every submission to fss-cv-wfm-p5en fail with
+            # "explicit deny in a service control policy". Batch propagates
+            # these onto the training job, which is why working jobs in that
+            # queue show the tags on SageMaker but `payload Tags: None`.
+            tags=tag_map(),
         )
         print(f"Queued: {queued}")
     else:

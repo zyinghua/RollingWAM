@@ -780,6 +780,15 @@ class Wan22Trainer:
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
 
+        # A resumed run that is already finished must exit here, before the eval
+        # and before the dataloader is built.
+        if self.global_step >= self.max_steps:
+            logger.info(
+                "[done] resumed at step=%d with max_steps=%d; nothing left to train.",
+                self.global_step, self.max_steps,
+            )
+            return
+
         # Smoke-test the eval path before committing hours to training. evaluate()
         # exercises the most failure-prone code here — an ffmpeg fork, a
         # cross-rank gather, and a VAE decode — none of which a plain training
