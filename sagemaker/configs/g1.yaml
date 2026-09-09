@@ -6,8 +6,14 @@ instance_count: 1
 queue: cv-spot
 
 channels:
+  # Holds bottle/ dog/ plate/ pour/ text_embeds_cache/ — the layout
+  # configs/data/g1_lerobot_v3.yaml derives dataset_dirs and
+  # text_embedding_cache_dir from, via the data.dataset_root override below.
+  # File mode, not FastFile: the whole set is ~410 MB in 33 objects, so the
+  # up-front download is seconds and every read is local afterwards, while a
+  # lazily mounted prefix would pay per-object latency on each access.
   g1:
-    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/OmniEmbodied_Data
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/lerobotv3/self_collected
     mode: File
     distribution: FullyReplicated
   pretrained:

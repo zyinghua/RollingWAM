@@ -426,9 +426,15 @@ def main() -> None:
     # Keep checkpoint_s3_uri small enough that SageMaker can restore it on a
     # spot restart. Nothing prunes checkpoints otherwise, and past ~369 GB the
     # restore fails with an opaque InternalServerError before the container
-    # starts (measured; see prune_checkpoints.py). Main host only, and every
+    # starts (measured; see prune_checkpoints.py).
+    #
+    # Runs on EVERY host, but only the main one mutates S3 (manage_s3 below).
+    # DeepSpeed writes shards from every rank, so a main-host-only pruner leaves
+    # the other hosts' local copies in place and SageMaker's sync uploads them
+    # straight back: the 2-node vlaspot run re-archived the same step every 22
+    # minutes for a day and a half without the prefix ever shrinking. Every
     # failure inside is swallowed — this must never be able to kill training.
-    if dist["machine_rank"] == 0 and os.environ.get(
+    if os.environ.get(
         f"{sm_env.ENV_PREFIX}_PRUNE_CHECKPOINTS", "true"
     ).lower() != "false":
         out_dir = next(
@@ -442,6 +448,7 @@ def main() -> None:
                     out_dir,
                     os.environ.get(f"{sm_env.ENV_PREFIX}_CHECKPOINT_S3", ""),
                     keep=int(os.environ.get(f"{sm_env.ENV_PREFIX}_PRUNE_KEEP", "1")),
+                    manage_s3=dist["machine_rank"] == 0,
                 )
             except Exception as exc:
                 print(f"[entry] checkpoint pruner not started ({exc}); continuing", flush=True)
