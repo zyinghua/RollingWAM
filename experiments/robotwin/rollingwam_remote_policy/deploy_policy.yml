@@ -1,0 +1,16 @@
+# RoboTwin's standard evaluator configuration.
+policy_name: rollingwam_remote_policy
+task_name: null
+task_config: null
+ckpt_setting: remote
+seed: 42
+instruction_type: unseen
+eval_num_episodes: 100
+eval_output_dir: null
+
+# Model server connection. No checkpoint or model dependencies are needed here.
+server_uri: ws://127.0.0.1:8000
+connect_timeout: 30.0
+# null permits slow first inference/compilation. A numeric value is in seconds.
+request_timeout: null
+skip_get_obs_within_replan: false

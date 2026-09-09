@@ -32,11 +32,13 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int = 8000,
         metadata: dict | None = None,
+        ping_interval: float | None = 20.0,
     ) -> None:
         self._policy = policy
         self._host = str(host)
         self._port = int(port)
         self._metadata = metadata or {}
+        self._ping_interval = ping_interval
         self._client_active = False
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
@@ -50,6 +52,7 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            ping_interval=self._ping_interval,
             process_request=_health_check,
         ) as server:
             logger.info("Policy server listening on ws://%s:%d", self._host, self._port)
