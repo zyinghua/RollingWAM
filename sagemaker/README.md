@@ -18,6 +18,7 @@ Every submission names its target explicitly — nothing is ever implied.
 | `robotwin_selected` | 6-task window-size ablation only; needs an in-repo task index (below) | `robotwin_selected_tasks_rolling_3cam_384_1e-4` |
 | `robotwin_smoke` | pre-flight check, 4 steps on the full-RoboTwin task | `robotwin_rolling_3cam_384_1e-4` |
 | `libero` | all four LIBERO suites together; needs two uploads (below) | `libero_rolling_2cam224_1e-4` |
+| `g1` | LeRobot v3 G1 training; defaults to every dataset in the data config | `g1_rolling_1cam_320_1e-4` |
 
 ## 0. Dry run (no AWS calls, nothing submitted)
 
@@ -38,10 +39,9 @@ The image is target-independent, so any `--config` builds the same one. Re-run
 only when code or dependencies change; layer caching makes incremental builds
 fast. Submitting without `SKIP_BUILD=1` also does this automatically.
 
-⚠️ **Run this once before any `SKIP_BUILD=1` submit.** FastWAM's image lives in
-a different ECR repo (`fastwam`), so `rollingwam:latest` does not exist until
-this step runs. The ECR repo itself is created automatically. A `SKIP_BUILD=1`
-submit beforehand queues, then fails at image pull.
+⚠️ **Run this once before any `SKIP_BUILD=1` submit.** The
+`rollingwam:latest` image does not exist until this step runs. The ECR repo is
+created automatically; submitting before the build fails at image pull.
 
 ## 2. Smoke test (1 node, ~15 min)
 
@@ -135,6 +135,24 @@ Two uploads first, since FastWAM mirrored no LIBERO data to S3 (exact commands
 in the header of `sagemaker/configs/libero.yaml`): the four converted suite
 datasets from `/datasets/libero-fastwam/libero_mujoco3.3.2`, and the text-embed cache produced by
 `scripts/libero/precompute_libero_text_embeds.sh`.
+
+### G1
+
+Upload the LeRobot v3 dataset and its text cache once:
+
+```bash
+aws s3 sync /datasets/OmniEmbodied_Data \
+  s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/OmniEmbodied_Data \
+  --exclude '.cache/*'
+```
+
+The target defaults to every configured G1 dataset. Narrow a job to one task by
+overriding `data.dataset_dirs` with the mounted SageMaker path:
+
+```bash
+SKIP_BUILD=1 bash sagemaker/run_sm.sh g1 1 g1-bottle-rolling \
+  'data.dataset_dirs=[/opt/ml/input/data/g1/bottle]'
+```
 
 ## 4. Monitor
 
