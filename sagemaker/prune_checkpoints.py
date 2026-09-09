@@ -19,15 +19,30 @@ The trainer has no retention policy, so any long run walks itself into this.
 Policy
 ------
 Newest checkpoint stays in ``checkpoint_s3_uri`` (small restore). The previous
-one is MOVED to a sibling ``<prefix>-archive/`` — outside the restore path, so
-it costs nothing at startup, but is still there if the newest turns out to have
+one is MOVED to ``<parent>/_archive/<job>/`` — outside the restore path, so it
+costs nothing at startup, but is still there if the newest turns out to have
 been cut mid-write by a spot reclaim. Without that spare, a corrupt newest makes
 auto-resume reject everything and silently restart from step 0.
+
+The archive deliberately does NOT live at ``<prefix>-archive/``. S3 prefix
+matching is plain string matching and ``CheckpointConfig.S3Uri`` carries no
+trailing slash, so ``<prefix>-archive/...`` starts with ``<prefix>`` and may be
+pulled into the very restore the archive exists to stay out of. Measured on the
+vlaspot run: 369 GB under the prefix proper, 646 GB once the sibling archive is
+counted. Nesting it under a ``_archive/`` directory cannot collide either way.
 
 Anything older than that is deleted. Local copies under /opt/ml/checkpoints are
 removed too, otherwise SageMaker's sync just re-uploads what we pruned.
 
-Runs as a forked daemon from entry.py (see ``spawn``), on the main host only.
+Runs as a forked daemon from entry.py (see ``spawn``) on EVERY host. Only the
+main host mutates S3; the others just reconcile their own local directory
+against it. That split matters on multi-node jobs: DeepSpeed writes shards from
+every rank, so a main-host-only pruner deletes its own local copy and S3's, and
+then the *other* hosts' untouched copies get synced straight back. The vlaspot
+2-node run archived the same step_002500 every 22 minutes for a day and a half
+— 303 log lines, prefix never shrank — while the 1-node libero runs pruned
+correctly.
+
 Every failure is swallowed: pruning must never be able to kill training.
 """
 
@@ -42,6 +57,7 @@ import time
 from pathlib import Path
 
 STEP_RE = re.compile(r"^step_(\d+)/?$")
+LOCAL_STEP_RE = re.compile(r"^step_(\d+)$")
 
 
 def _run(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
@@ -65,6 +81,58 @@ def s3_steps(prefix: str) -> list[int]:
             if m:
                 steps.append(int(m.group(1)))
     return sorted(steps)
+
+
+def local_steps(local_state: Path) -> list[int]:
+    """Step numbers of the ``step_NNNNNN/`` dirs that exist locally."""
+    if not local_state.is_dir():
+        return []
+    steps = []
+    try:
+        for p in local_state.iterdir():
+            m = LOCAL_STEP_RE.match(p.name)
+            if m and p.is_dir():
+                steps.append(int(m.group(1)))
+    except OSError:
+        return []
+    return sorted(steps)
+
+
+def drop_local(steps, local_state: Path, local_weights: Path, say) -> None:
+    for step in steps:
+        name = f"step_{step:06d}"
+        try:
+            d = local_state / name
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+            f = local_weights / f"{name}.pt"
+            if f.is_file():
+                f.unlink()
+        except OSError as exc:
+            say(f"local cleanup of {name} failed (harmless): {exc}")
+
+
+def reconcile_local(state_s3: str, local_state: Path, local_weights: Path,
+                    verbose: bool = True) -> None:
+    """Non-main hosts: drop local checkpoints the main host already pruned.
+
+    S3 is the source of truth, since only the main host writes it. Deletes only
+    steps strictly OLDER than the newest step present in S3 — a step newer than
+    that has simply not been synced up yet, and removing it would throw away a
+    fresh checkpoint.
+    """
+    def say(msg: str) -> None:
+        if verbose:
+            print(f"[prune] {msg}", flush=True)
+
+    remote = s3_steps(state_s3)
+    if not remote:
+        return
+    newest = max(remote)
+    stale = [s for s in local_steps(local_state) if s < newest and s not in remote]
+    if stale:
+        say(f"local-only cleanup of {stale} (already pruned from S3 by the main host)")
+        drop_local(stale, local_state, local_weights, say)
 
 
 def prune_once(state_s3: str, weights_s3: str, archive_s3: str, local_state: Path,
@@ -95,24 +163,23 @@ def prune_once(state_s3: str, weights_s3: str, archive_s3: str, local_state: Pat
         _run(["aws", "s3", "rm", f"{state_s3.rstrip('/')}/{name}/", "--recursive", "--only-show-errors"])
         _run(["aws", "s3", "rm", f"{weights_s3.rstrip('/')}/{name}.pt", "--only-show-errors"])
 
-    # Drop the local copies too, or the checkpoint sync re-uploads them.
-    for step in [*to_archive, *to_delete]:
-        name = f"step_{step:06d}"
-        try:
-            d = local_state / name
-            if d.is_dir():
-                shutil.rmtree(d, ignore_errors=True)
-            f = local_weights / f"{name}.pt"
-            if f.is_file():
-                f.unlink()
-        except OSError as exc:
-            say(f"local cleanup of {name} failed (harmless): {exc}")
+    # Drop the local copies too, or the checkpoint sync re-uploads them. This
+    # only covers THIS host; the other hosts reconcile via reconcile_local().
+    drop_local([*to_archive, *to_delete], local_state, local_weights, say)
 
     if to_archive or to_delete:
         say(f"kept {newest}, archived {to_archive}, deleted {to_delete}")
 
 
-def loop(output_dir: str, checkpoint_s3: str, keep: int, interval: int) -> None:
+def archive_uri(checkpoint_s3: str, rel: str) -> str:
+    """``<parent>/_archive/<job>/<rel>`` — never a string prefix of the job's URI."""
+    trimmed = checkpoint_s3.rstrip("/")
+    parent, _, job = trimmed.rpartition("/")
+    return f"{parent}/_archive/{job}/{rel}"
+
+
+def loop(output_dir: str, checkpoint_s3: str, keep: int, interval: int,
+         manage_s3: bool = True) -> None:
     rel = ""
     try:
         rel = str(Path(output_dir).resolve().relative_to("/opt/ml/checkpoints"))
@@ -120,25 +187,32 @@ def loop(output_dir: str, checkpoint_s3: str, keep: int, interval: int) -> None:
         return  # output_dir is not inside the mirrored dir; nothing to prune
     base = f"{checkpoint_s3.rstrip('/')}/{rel}/checkpoints"
     state_s3, weights_s3 = f"{base}/state", f"{base}/weights"
-    archive_s3 = f"{checkpoint_s3.rstrip('/')}-archive/{rel}"
+    archive_s3 = archive_uri(checkpoint_s3, rel)
     local = Path(output_dir) / "checkpoints"
+    role = "main host: prunes S3" if manage_s3 else "worker: local cleanup only"
     print(f"[prune] watching {state_s3} (keep={keep}, every {interval}s, "
-          f"archive -> {archive_s3})", flush=True)
+          f"archive -> {archive_s3}) [{role}]", flush=True)
     while True:
         time.sleep(interval)
         try:
-            prune_once(state_s3, weights_s3, archive_s3, local / "state",
-                       local / "weights", keep=keep)
+            if manage_s3:
+                prune_once(state_s3, weights_s3, archive_s3, local / "state",
+                           local / "weights", keep=keep)
+            else:
+                reconcile_local(state_s3, local / "state", local / "weights")
         except Exception as exc:  # never let pruning kill the job
             print(f"[prune] error (ignored): {exc}", flush=True)
 
 
 def spawn(output_dir: str, checkpoint_s3: str, *, keep: int = 1,
-          interval: int = 900) -> None:
+          interval: int = 900, manage_s3: bool = True) -> None:
     """Fork a daemon that prunes periodically; returns immediately in the parent.
 
-    entry.py calls this just before ``os.execvp``. exec replaces the parent's
-    process image but leaves children running, so the daemon outlives it.
+    entry.py calls this just before ``os.execvp`` on EVERY host. exec replaces
+    the parent's process image but leaves children running, so the daemon
+    outlives it. Pass ``manage_s3=False`` on non-main hosts: they must still
+    clear their own local copies (otherwise the checkpoint sync re-uploads what
+    the main host pruned) but must not race it writing S3.
     """
     if not checkpoint_s3:
         return
@@ -153,7 +227,7 @@ def spawn(output_dir: str, checkpoint_s3: str, *, keep: int = 1,
     except OSError:
         pass
     try:
-        loop(output_dir, checkpoint_s3, keep, interval)
+        loop(output_dir, checkpoint_s3, keep, interval, manage_s3=manage_s3)
     except Exception as exc:
         print(f"[prune] daemon exiting: {exc}", flush=True)
     finally:
