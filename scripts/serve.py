@@ -16,9 +16,6 @@ for path in (str(PROJECT_ROOT), str(SRC_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from rollingwam.serving.rollingwam_policy import RollingWAMPolicy  # noqa: E402
-from rollingwam.serving.websocket_policy_server import WebsocketPolicyServer  # noqa: E402
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a RollingWAM checkpoint over WebSocket.")
@@ -97,11 +94,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-action-infer", action="store_true")
     parser.add_argument("--compile-vae-encode", action="store_true")
     parser.add_argument("--vae-encode-batch-size", type=int, default=1)
-    return parser.parse_args()
+    parser.add_argument(
+        "--save-imagined-rollouts",
+        action="store_true",
+        help=(
+            "Append predicted frames to one server-side MP4 per session. Disconnect, "
+            "instruction change, or Ctrl+C finalizes the video."
+        ),
+    )
+    parser.add_argument(
+        "--imagined-dir",
+        default=None,
+        help="Server output directory; required with --save-imagined-rollouts.",
+    )
+    args = parser.parse_args()
+    if args.save_imagined_rollouts and (
+        args.imagined_dir is None or not args.imagined_dir.strip()
+    ):
+        parser.error("--imagined-dir is required with --save-imagined-rollouts")
+    return args
 
 
 def main() -> None:
     args = _parse_args()
+    from rollingwam.serving.rollingwam_policy import RollingWAMPolicy
+    from rollingwam.serving.websocket_policy_server import WebsocketPolicyServer
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -127,6 +145,8 @@ def main() -> None:
         action_key=args.action_key,
         default_instruction=args.default_instruction,
         fps=args.fps,
+        save_imagined_rollouts=args.save_imagined_rollouts,
+        imagined_dir=args.imagined_dir,
     )
     server = WebsocketPolicyServer(
         policy,
@@ -134,7 +154,10 @@ def main() -> None:
         port=args.port,
         metadata=policy.server_metadata(),
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        policy.reset()
 
 
 if __name__ == "__main__":

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 import threading
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import imageio
 import numpy as np
 import torch
 import torchvision.transforms.functional as transforms_F
@@ -186,6 +189,8 @@ class RollingWAMPolicy:
         concat_multi_camera: str | None = None,
         default_instruction: str = "",
         fps: float,
+        save_imagined_rollouts: bool = False,
+        imagined_dir: str | Path | None = None,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -203,8 +208,8 @@ class RollingWAMPolicy:
 
         if len(self.video_size) != 2 or min(self.video_size) < 1:
             raise ValueError(f"video_size must be positive [H,W], got {self.video_size}.")
-        if self.fps <= 0:
-            raise ValueError(f"fps must be positive, got {self.fps}.")
+        if not math.isfinite(self.fps) or self.fps <= 0:
+            raise ValueError(f"fps must be positive and finite, got {self.fps}.")
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be positive.")
         if self.num_inference_steps % int(self.model.window_blocks) != 0:
@@ -289,6 +294,27 @@ class RollingWAMPolicy:
             args={"img_h": self.video_size[0], "img_w": self.video_size[1]}
         )
         self._final_normalize = Normalize(args={"mean": 0.5, "std": 0.5})
+
+        self.save_imagined_rollouts = bool(save_imagined_rollouts)
+        self.imagined_dir: Path | None = None
+        self._imagined_writer: Any = None
+        self._imagined_path: Path | None = None
+        self._imagined_chunks = 0
+        self._imagined_session = -1
+        if self.save_imagined_rollouts:
+            if imagined_dir is None or not str(imagined_dir).strip():
+                raise ValueError("Saving imagined rollouts requires imagined_dir.")
+            frames_per_chunk = int(self.model.vae.temporal_downsample_factor) * int(self.model.chunk_latents)
+            self._imagined_fps = self.fps * frames_per_chunk / int(self.model.actions_per_chunk)
+            if not math.isfinite(self._imagined_fps) or self._imagined_fps <= 0:
+                raise ValueError("Checkpoint geometry must give a positive, finite imagined video FPS.")
+            output_root = Path(imagined_dir).expanduser().resolve()
+            output_root.mkdir(parents=True, exist_ok=True)
+            self.imagined_dir = Path(tempfile.mkdtemp(
+                prefix=datetime.now().strftime("run_%Y%m%d_%H%M%S_"), dir=output_root,
+            ))
+            logger.info("Saving imagined rollouts to %s | fps=%g",
+                        self.imagined_dir, self._imagined_fps)
         self.reset()
 
     @classmethod
@@ -314,6 +340,8 @@ class RollingWAMPolicy:
         action_key: str | None = None,
         default_instruction: str = "",
         fps: float,
+        save_imagined_rollouts: bool = False,
+        imagined_dir: str | Path | None = None,
     ) -> "RollingWAMPolicy":
         checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
@@ -368,6 +396,8 @@ class RollingWAMPolicy:
             concat_multi_camera=cfg.data.train.get("concat_multi_camera"),
             default_instruction=default_instruction,
             fps=fps,
+            save_imagined_rollouts=save_imagined_rollouts,
+            imagined_dir=imagined_dir,
         )
 
     def _preprocess_image(
@@ -556,9 +586,76 @@ class RollingWAMPolicy:
                 compile_action_infer=self.compile_action_infer,
             )
             self._active_instruction = instruction
-            return {self.action_key: self._denormalize_action(prediction["action"])}
+            action = self._denormalize_action(prediction["action"])
+            if self.save_imagined_rollouts:
+                self._record_imagined_chunk(new_frames, prediction["video"])
+            return {self.action_key: action}
+
+    def _disable_imagined_recording(self) -> None:
+        logger.exception("Imagined rollout recording failed; disabling recording and continuing action inference.")
+        self.save_imagined_rollouts = False
+        self._close_imagined_rollout()
+        # A failed VAE decode may retain intermediate tensors until its next call.
+        try:
+            self.model.vae.model.clear_cache()
+        except Exception:
+            logger.debug("Could not clear VAE caches after recording failure", exc_info=True)
+
+    def _record_imagined_chunk(self, new_frames: torch.Tensor, video_latents: torch.Tensor) -> None:
+        """Append each observation-conditioned prediction to the session's MP4.
+
+        Decode with the current observation as context, then append only future
+        frames after the first call. This bounds memory without retaining VAE
+        caches across inference calls or accumulating the session's latents.
+        """
+        try:
+            # The emitted front is a view into the rolling window's storage.
+            chunk = video_latents.detach().to(device="cpu", copy=True)
+            # Encoding is deterministic and happens after normal action inference.
+            anchor = self.model._encode_video_latents(
+                new_frames.to(device=self.model.device, dtype=self.model.torch_dtype)
+            ).detach().to(device="cpu", copy=True)
+            stream = torch.cat([anchor, chunk], dim=2)
+            frames = self.model._decode_latents(stream)
+            expected = 1 + chunk.shape[2] * int(self.model.vae.temporal_downsample_factor)
+            if len(frames) != expected:
+                raise ValueError(f"Expected {expected} imagined frames, got {len(frames)}.")
+            if self._imagined_writer is None:
+                self._imagined_path = self.imagined_dir / f"session{self._imagined_session:04d}.mp4"
+                self._imagined_writer = imageio.get_writer(
+                    str(self._imagined_path), fps=self._imagined_fps,
+                    codec="libx264", format="FFMPEG", pixelformat="yuv420p",
+                )
+                logger.info("Recording imagined rollout | %s", self._imagined_path)
+            else:
+                frames = frames[1:]
+            for frame in frames:
+                self._imagined_writer.append_data(np.asarray(frame.convert("RGB")))
+            self._imagined_chunks += 1
+        except Exception:
+            self._disable_imagined_recording()
+
+    def _close_imagined_rollout(self) -> None:
+        """Finalize the current MP4; callers hold the policy lock."""
+        writer = self._imagined_writer
+        video_path = self._imagined_path
+        chunks = self._imagined_chunks
+        self._imagined_writer = None
+        self._imagined_path = None
+        self._imagined_chunks = 0
+        if writer is None:
+            return
+        try:
+            writer.close()
+            logger.info("Saved imagined rollout | %s | chunks=%d | instruction=%s",
+                        video_path, chunks, self._active_instruction)
+        except Exception:
+            logger.exception("Could not finalize imagined rollout %s; disabling recording", video_path)
+            self.save_imagined_rollouts = False
 
     def _reset_unlocked(self) -> None:
+        self._close_imagined_rollout()
+        self._imagined_session += 1
         self.model.rolling_reset()
         self._active_instruction = None
 

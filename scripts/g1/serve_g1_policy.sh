@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # Serve a trained RollingWAM G1 policy over WebSocket.
 # Usage:
-#   bash scripts/g1/serve_g1_policy.sh <checkpoint.pt>
+#   bash scripts/g1/serve_g1_policy.sh <checkpoint.pt> [server options]
+# Append imagined frames to one MP4 per session on the server:
+#   bash scripts/g1/serve_g1_policy.sh <checkpoint.pt> \
+#     --save-imagined-rollouts --imagined-dir /workspace/RollingWAM/imagined_rollouts
+# Disconnect, instruction change, or Ctrl+C finalizes the video.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: bash scripts/g1/serve_g1_policy.sh <checkpoint.pt>" >&2
+if [[ $# -lt 1 ]]; then
+  echo "Usage: bash scripts/g1/serve_g1_policy.sh <checkpoint.pt> [server options]" >&2
   exit 2
 fi
 
 CHECKPOINT="$1"
+shift
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
 PYTHONDONTWRITEBYTECODE=1 \
@@ -29,4 +34,5 @@ python scripts/serve.py \
   --action-key action \
   --fps 10 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 8000 \
+  "$@"
