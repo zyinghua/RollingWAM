@@ -51,3 +51,5 @@ artifacts/
 tmp/
 temp/
 *.log
+
+evaluated_results/
