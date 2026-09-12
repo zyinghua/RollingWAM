@@ -175,8 +175,11 @@ def main(argv=None) -> int:
         for row in summary:
             jump = "n/a" if row["jump_boundary_mean"] is None else f"{row['jump_boundary_mean']:.6g}"
             curvature = "n/a" if row["curvature_boundary_mean"] is None else f"{row['curvature_boundary_mean']:.6g}"
+            ratio = row["curvature_boundary_to_interior"]
+            normalized_curvature = "n/a" if ratio is None else f"{ratio:.6g}"
             print(f"{row['method']} / {row['embodiment']} / {row['source']} / {row['group']}: "
-                  f"boundary_jump={jump}, boundary_second_difference={curvature}, episodes={row['num_episodes']}")
+                  f"boundary_jump={jump}, boundary_second_difference={curvature}, "
+                  f"boundary_to_interior_second_difference={normalized_curvature}, episodes={row['num_episodes']}")
         print(f"Saved reports to {args.output.resolve()} (skipped {len(skipped)} incomplete traces)")
         return 0
     except (ValueError, TypeError, KeyError, OSError) as exc:
