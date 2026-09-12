@@ -14,3 +14,6 @@ connect_timeout: 30.0
 # null permits slow first inference/compilation. A numeric value is in seconds.
 request_timeout: null
 skip_get_obs_within_replan: false
+# Record on the simulator client, where execution and chunk boundaries are known.
+smoothness_dir: null
+smoothness_method: Rolling-WAM

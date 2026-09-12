@@ -19,3 +19,6 @@ negative_prompt: ""
 timing_enabled: false
 skip_get_obs_within_replan: false
 save_imagined_rollouts: false
+# Optional executed commands before RoboTwin controller interpolation.
+smoothness_dir: null
+smoothness_method: Rolling-WAM

@@ -26,6 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 from rollingwam.datasets.lerobot.processors.rollingwam_processor import RollingWAMProcessor
 from rollingwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from rollingwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from rollingwam.evaluation.smoothness.robotwin import RoboTwinActionTrace
 from rollingwam.utils.config_resolvers import register_default_resolvers
 from rollingwam.utils.video_io import save_mp4
 
@@ -153,6 +154,9 @@ class WorldActionRobotWinPolicy:
         imagined_dir: Optional[Path] = None,
         replan_steps: Optional[int] = None,
         compile_action_infer: bool = False,
+        smoothness_dir: Optional[Path] = None,
+        smoothness_method: str = "Rolling-WAM",
+        smoothness_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -194,6 +198,23 @@ class WorldActionRobotWinPolicy:
                 )
 
         self.pending_actions: deque[np.ndarray] = deque()
+        self.action_trace = None
+        if smoothness_dir is not None:
+            self.action_trace = RoboTwinActionTrace(
+                smoothness_dir,
+                method=smoothness_method,
+                metadata={
+                    "checkpoint": checkpoint_path,
+                    "dataset_stats": str(dataset_stats_path),
+                    "evaluation_seed": self.seed,
+                    "window_blocks": int(self.model.window_blocks),
+                    "actions_per_chunk": int(self.model.actions_per_chunk),
+                    "execute_horizon": self.replan_steps or int(self.model.actions_per_chunk),
+                    "num_inference_steps": self.num_inference_steps,
+                    **(smoothness_metadata or {}),
+                },
+            )
+            atexit.register(self.action_trace.close)
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -339,6 +360,8 @@ class WorldActionRobotWinPolicy:
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        if self.action_trace is not None and self.action_trace.finish_if_terminal(task_env):
+            return
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -347,6 +370,8 @@ class WorldActionRobotWinPolicy:
                 )
             instruction = task_env.get_instruction()
             self._fill_action_queue(observation=observation, instruction=instruction)
+            if self.pending_actions and self.action_trace is not None:
+                self.action_trace.begin_chunk(task_env, instruction)
 
         if not self.pending_actions:
             logger.warning("No action generated; skip current eval step.")
@@ -354,7 +379,10 @@ class WorldActionRobotWinPolicy:
 
         action = self.pending_actions.popleft()
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
-        task_env.take_action(action, action_type="qpos")
+        if self.action_trace is None:
+            task_env.take_action(action, action_type="qpos")
+        else:
+            self.action_trace.take_action(task_env, action)
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
         self.step_count += 1
@@ -386,6 +414,8 @@ class WorldActionRobotWinPolicy:
         self._replan_times = []
 
     def reset(self) -> None:
+        if self.action_trace is not None:
+            self.action_trace.reset()
         self.pending_actions.clear()
         if self.save_imagined_rollouts:
             self._flush_imagined_rollout()
@@ -473,6 +503,16 @@ def get_model(usr_args: Dict[str, Any]):
         compile_action_infer=_parse_bool(
             usr_args.get("compile_action_infer", cfg.EVALUATION.get("compile_action_infer", False))
         ),
+        smoothness_dir=(
+            None if _is_none_like(usr_args.get("smoothness_dir"))
+            else Path(str(usr_args["smoothness_dir"])).expanduser()
+        ),
+        smoothness_method=str(usr_args.get("smoothness_method", "Rolling-WAM")),
+        smoothness_metadata={
+            "task": usr_args.get("task_name"),
+            "task_config": usr_args.get("task_config"),
+            "instruction_type": usr_args.get("instruction_type"),
+        },
     )
     return policy
 

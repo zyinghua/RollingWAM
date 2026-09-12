@@ -24,6 +24,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from rollingwam.serving import msgpack_numpy
+from rollingwam.evaluation.smoothness.robotwin import RoboTwinActionTrace
 
 
 LOGGER = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ class RemoteRollingWAMRobotWinPolicy:
         seed: int | None = None,
         open_timeout: float = 30.0,
         request_timeout: float | None = None,
+        smoothness_dir: str | Path | None = None,
+        smoothness_method: str = "Rolling-WAM",
+        smoothness_metadata: dict[str, Any] | None = None,
     ) -> None:
         if not isinstance(server_uri, str) or not server_uri.startswith(("ws://", "wss://")):
             raise ValueError("server_uri must be a ws:// or wss:// WebSocket URL")
@@ -72,6 +76,7 @@ class RemoteRollingWAMRobotWinPolicy:
         self.pending_actions: deque[np.ndarray] = deque()
         self._socket = None
         self.metadata: dict[str, Any] = {}
+        self.action_trace = None
 
         # Import lazily so inspecting policy configuration does not open a socket.
         from websockets.sync.client import connect
@@ -89,6 +94,16 @@ class RemoteRollingWAMRobotWinPolicy:
             # Metadata is sent only after the server accepts this exclusive session.
             self.metadata = self._receive(timeout=self.open_timeout)
             self._validate_metadata()
+            if smoothness_dir is not None:
+                self.action_trace = RoboTwinActionTrace(
+                    smoothness_dir,
+                    method=smoothness_method,
+                    metadata={
+                        **self.metadata,
+                        "evaluation_seed": self.seed,
+                        **(smoothness_metadata or {}),
+                    },
+                )
         except Exception as exc:
             self.close()
             raise RuntimeError(f"Could not initialize RoboTwin policy at {self.server_uri}: {exc}") from exc
@@ -140,6 +155,8 @@ class RemoteRollingWAMRobotWinPolicy:
 
     def reset(self) -> None:
         """Reset both ends at every episode, including repeated instructions."""
+        if self.action_trace is not None:
+            self.action_trace.reset()
         self.pending_actions.clear()
         response = self._request({"op": "reset", "seed": self.seed})
         if response.get("ok") is not True:
@@ -148,6 +165,8 @@ class RemoteRollingWAMRobotWinPolicy:
 
     def close(self) -> None:
         """Release the server's exclusive session; safe to call more than once."""
+        if self.action_trace is not None:
+            self.action_trace.close()
         self.pending_actions.clear()
         socket, self._socket = self._socket, None
         if socket is not None:
@@ -191,6 +210,8 @@ class RemoteRollingWAMRobotWinPolicy:
         self.pending_actions.extend(row.copy() for row in action)
 
     def step(self, env: Any, observation: dict[str, Any] | None) -> None:
+        if self.action_trace is not None and self.action_trace.finish_if_terminal(env):
+            return
         if not self.pending_actions:
             if observation is None:
                 raise ValueError("A fresh observation is required when requesting an action chunk")
@@ -200,7 +221,13 @@ class RemoteRollingWAMRobotWinPolicy:
             if not isinstance(instruction, str) or not instruction.strip():
                 raise ValueError("RoboTwin instruction must be a nonempty string")
             self._fill_action_queue(observation, instruction)
-        env.take_action(self.pending_actions.popleft(), action_type="qpos")
+            if self.action_trace is not None:
+                self.action_trace.begin_chunk(env, instruction)
+        action = self.pending_actions.popleft()
+        if self.action_trace is None:
+            env.take_action(action, action_type="qpos")
+        else:
+            self.action_trace.take_action(env, action)
 
 
 def encode_obs(observation: Any) -> Any:
@@ -213,6 +240,13 @@ def get_model(usr_args: dict[str, Any]) -> RemoteRollingWAMRobotWinPolicy:
         seed=usr_args.get("seed"),
         open_timeout=usr_args.get("connect_timeout", 30.0),
         request_timeout=usr_args.get("request_timeout"),
+        smoothness_dir=usr_args.get("smoothness_dir"),
+        smoothness_method=usr_args.get("smoothness_method", "Rolling-WAM"),
+        smoothness_metadata={
+            "task": usr_args.get("task_name"),
+            "task_config": usr_args.get("task_config"),
+            "instruction_type": usr_args.get("instruction_type"),
+        },
     )
     output_dir = usr_args.get("eval_output_dir")
     if output_dir:

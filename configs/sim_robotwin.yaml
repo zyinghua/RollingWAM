@@ -29,6 +29,8 @@ EVALUATION:
   timing_enabled: false
   skip_get_obs_within_replan: false
   save_imagined_rollouts: false  # save per-episode imagined video mp4s next to the sim recordings
+  smoothness_dir: null  # opt-in pre-interpolation executed-action JSONL traces
+  smoothness_method: Rolling-WAM
 
   # Runtime inputs
   dataset_stats_path: null

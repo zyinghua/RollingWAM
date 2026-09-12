@@ -77,6 +77,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", help="New or empty output directory; paths are relative to the repository")
     parser.add_argument("--run-name", default="rollingwam_remote", help="Result label; no checkpoint is needed here")
+    parser.add_argument("--smoothness-dir", help="Opt-in executed-action traces; paths are relative to the repository")
+    parser.add_argument("--smoothness-method", default="Rolling-WAM", help="Method label stored in smoothness traces")
     parser.add_argument(
         "--skip-get-obs-within-replan", action=argparse.BooleanOptionalAction, default=None,
         help="Default: enabled for --shard-id/--all-tasks, disabled otherwise; affects randomized lighting and video",
@@ -157,6 +159,8 @@ def _build_command(args: argparse.Namespace, task: str, task_config: str, output
         "skip_get_obs_within_replan": args.skip_get_obs_within_replan,
         "connect_timeout": args.connect_timeout,
         "request_timeout": args.request_timeout,
+        "smoothness_dir": str(_resolve_path(args.smoothness_dir)) if args.smoothness_dir else None,
+        "smoothness_method": args.smoothness_method,
     }
     command = [sys.executable, "-u", "script/eval_policy.py", "--config", f"policy/{POLICY_NAME}/deploy_policy.yml", "--overrides"]
     for key, value in overrides.items():

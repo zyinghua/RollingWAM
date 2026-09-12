@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 from pathlib import Path
@@ -107,6 +108,19 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Server output directory; required with --save-imagined-rollouts.",
     )
+    parser.add_argument(
+        "--smoothness-dir",
+        default=None,
+        help=(
+            "Optional directory for denormalized prediction traces and replan boundaries. "
+            "These are server predictions, not confirmed executed robot commands."
+        ),
+    )
+    parser.add_argument(
+        "--smoothness-method",
+        default="Rolling-WAM",
+        help="Method label saved with optional smoothness traces.",
+    )
     args = parser.parse_args()
     if args.save_imagined_rollouts and (
         args.imagined_dir is None or not args.imagined_dir.strip()
@@ -124,6 +138,23 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+
+    action_trace_recorder = None
+    if args.smoothness_dir is not None:
+        from rollingwam.evaluation.smoothness.recording import ActionTraceRecorder
+
+        action_trace_recorder = ActionTraceRecorder(
+            args.smoothness_dir,
+            method=args.smoothness_method,
+            embodiment=args.embodiment,
+            source="predicted_command",
+            metadata={
+                "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
+                "seed": args.seed,
+                "timestamp_semantics": "server_recording_time_not_execution_time",
+            },
+        )
+        atexit.register(action_trace_recorder.close)
 
     policy = RollingWAMPolicy.from_checkpoint(
         args.checkpoint,
@@ -147,6 +178,7 @@ def main() -> None:
         fps=args.fps,
         save_imagined_rollouts=args.save_imagined_rollouts,
         imagined_dir=args.imagined_dir,
+        action_trace_recorder=action_trace_recorder,
     )
     server = WebsocketPolicyServer(
         policy,

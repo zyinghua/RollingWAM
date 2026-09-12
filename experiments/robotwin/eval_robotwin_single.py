@@ -218,6 +218,9 @@ def main(cfg: DictConfig):
     _append_override(overrides, "text_cfg_scale", cfg.EVALUATION.text_cfg_scale)
     _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    smoothness_dir = _resolve_optional_path(cfg.EVALUATION.get("smoothness_dir"), base=PROJECT_ROOT)
+    _append_override(overrides, "smoothness_dir", str(smoothness_dir) if smoothness_dir else None)
+    _append_override(overrides, "smoothness_method", cfg.EVALUATION.get("smoothness_method", "Rolling-WAM"))
     _append_override(
         overrides,
         "skip_get_obs_within_replan",
