@@ -356,6 +356,8 @@ class WorldActionRobotWinPolicy:
                 seed=seed,
                 num_inference_steps=self.num_inference_steps,
                 compile_action_infer=self.compile_action_infer,
+                **({"return_video": self.save_imagined_rollouts}
+                   if getattr(self.model, "fastwam_mode", False) else {}),
             )
 
         timing_device = torch.device(self.model.device)
@@ -383,7 +385,7 @@ class WorldActionRobotWinPolicy:
             self._timing_rollout["infer_s"] += infer_elapsed
             self._replan_times.append(infer_elapsed)
 
-        if self.save_imagined_rollouts:
+        if self.save_imagined_rollouts and pred["video"] is not None:
             if self._imagined_anchor is None:
                 with torch.no_grad():
                     self._imagined_anchor = self.model._encode_video_latents(new_frames).detach()

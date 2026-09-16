@@ -596,12 +596,19 @@ class RollingWAMPolicy:
                 seed=self.seed,
                 num_inference_steps=self.num_inference_steps,
                 compile_action_infer=self.compile_action_infer,
+                **({"return_video": self.save_imagined_rollouts}
+                   if getattr(self.model, "fastwam_mode", False) else {}),
             )
             self._active_instruction = instruction
             action = self._denormalize_action(prediction["action"])
             self._record_action_chunk(action, instruction)
             if self.save_imagined_rollouts:
-                self._record_imagined_chunk(new_frames, prediction["video"])
+                if prediction["video"] is None:
+                    logger.warning("Imagined video generation stopped; finalizing recording and continuing action inference.")
+                    self.save_imagined_rollouts = False
+                    self._close_imagined_rollout()
+                else:
+                    self._record_imagined_chunk(new_frames, prediction["video"])
             return {self.action_key: action}
 
     def _record_action_chunk(self, action: np.ndarray, instruction: str) -> None:

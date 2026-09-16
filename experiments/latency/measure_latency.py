@@ -45,6 +45,7 @@ class RunSpec:
     text_dim: int
     action_dim: int
     proprio_dim: int
+    fastwam_mode: bool
     window_blocks: int
     chunk_latents: int
     actions_per_chunk: int
@@ -177,6 +178,7 @@ def make_run_spec(model: torch.nn.Module, cfg: Any, args: argparse.Namespace) ->
         text_dim=int(model.text_dim),
         action_dim=int(model.action_expert.action_dim),
         proprio_dim=int(model.proprio_dim),
+        fastwam_mode=bool(getattr(model, "fastwam_mode", False)),
         window_blocks=window_blocks,
         chunk_latents=chunk_latents,
         actions_per_chunk=actions_per_chunk,
@@ -251,6 +253,10 @@ def validate_output(output: dict[str, Any], spec: RunSpec) -> None:
         )
     if not torch.isfinite(action).all():
         raise RuntimeError("Action output contains non-finite values")
+    if spec.fastwam_mode:
+        if video is not None:
+            raise RuntimeError("FastWAM-mode latency must measure action-only inference without video")
+        return
     if not isinstance(video, torch.Tensor) or int(video.shape[2]) != spec.chunk_latents:
         raise RuntimeError(
             f"Video output has shape {getattr(video, 'shape', None)}, "
@@ -375,7 +381,10 @@ def main() -> None:
             "initialization_ms": init_ms,
             "steady_replan_ms": steady_ms,
             "action_shape": list(steady_output["action"].shape),
-            "video_shape": list(steady_output["video"].shape),
+            "video_shape": (
+                list(steady_output["video"].shape)
+                if steady_output.get("video") is not None else None
+            ),
         }
         records.append(record)
         print(

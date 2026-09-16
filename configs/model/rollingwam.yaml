@@ -68,7 +68,11 @@ rolling:
   actions_per_chunk: ${eval:'4 * ${model.rolling.chunk_latents} * ${data.train.action_video_freq_ratio}'}
   # true: restrict existing video/action attention to the current and earlier chunks
   disable_future_attention: false
-  # false: same-chunk A2A only; true: cross-chunk A2A, subject to disable_future_attention
+  # true: observed-image-only action context + cross-chunk A2A on the rolling schedule;
+  # future video remains a training objective, skipped during normal action inference
+  fastwam_mode: false
+  # false: same-chunk A2A only; true: cross-chunk A2A. fastwam_mode forces cross-chunk
+  # A2A regardless of this setting; disable_future_attention still restricts its direction.
   cross_chunk_a2a_attn: false
   init_schedule_prob: 0.2  # P(t_init); paper-prose beta=P(t_lin)=1-init_schedule_prob
   random_schedule_prob: 0.0  # chance of independent per-chunk noise levels (DF regularization); drawn among non-init samples

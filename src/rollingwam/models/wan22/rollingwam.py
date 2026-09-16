@@ -26,6 +26,7 @@ class RollingWAM(WAM):
         random_schedule_prob: float = 0.0,
         constant_schedule_prob: float = 0.0,
         disable_future_attention: bool = False,
+        fastwam_mode: bool = False,
     ):
         for a, b in (
             (self.train_video_scheduler, self.train_action_scheduler),
@@ -55,6 +56,8 @@ class RollingWAM(WAM):
                 "`disable_future_attention` must be bool, "
                 f"got {type(disable_future_attention).__name__}."
             )
+        if not isinstance(fastwam_mode, bool):
+            raise ValueError(f"`fastwam_mode` must be bool, got {type(fastwam_mode).__name__}.")
         if not 0.0 <= init_schedule_prob <= 1.0:
             raise ValueError(f"`init_schedule_prob` must be in [0, 1], got {init_schedule_prob}")
         if not 0.0 <= random_schedule_prob <= 1.0:
@@ -67,6 +70,7 @@ class RollingWAM(WAM):
         self.actions_per_chunk = int(actions_per_chunk)
         self.cross_chunk_a2a_attn = cross_chunk_a2a_attn
         self.disable_future_attention = disable_future_attention
+        self.fastwam_mode = fastwam_mode
         self.init_schedule_prob = float(init_schedule_prob)
         self.random_schedule_prob = float(random_schedule_prob)
         self.constant_schedule_prob = float(constant_schedule_prob)
@@ -91,7 +95,7 @@ class RollingWAM(WAM):
     ROLLING_KEYS = (
         "window_blocks", "chunk_latents", "actions_per_chunk",
         "cross_chunk_a2a_attn", "init_schedule_prob", "random_schedule_prob",
-        "constant_schedule_prob", "disable_future_attention",
+        "constant_schedule_prob", "disable_future_attention", "fastwam_mode",
     )
     ROLLING_LEGACY_DEFAULTS = {
         # Every checkpoint written before this option existed used same-chunk A2A.
@@ -100,6 +104,8 @@ class RollingWAM(WAM):
         "constant_schedule_prob": 0.0,
         # Older checkpoints allowed attention to future chunks in the window.
         "disable_future_attention": False,
+        # Older checkpoints denoised a joint video/action rolling window.
+        "fastwam_mode": False,
     }
 
     def get_rolling_config(self) -> dict[str, Any]:
@@ -205,8 +211,11 @@ class RollingWAM(WAM):
         mask = torch.zeros((total, total), dtype=torch.bool, device=device)
         mask[:video_seq_len, :video_seq_len] = True
         mask[:tokens_per_frame, tokens_per_frame:video_seq_len] = False
-        mask[video_seq_len:, :video_seq_len] = True
-        if self.cross_chunk_a2a_attn:
+        # FastWAM actions use only the real observation's video tokens. Future
+        # video remains an auxiliary training objective, not action context.
+        action_video_end = tokens_per_frame if self.fastwam_mode else video_seq_len
+        mask[video_seq_len:, :action_video_end] = True
+        if self.fastwam_mode or self.cross_chunk_a2a_attn:
             mask[video_seq_len:, video_seq_len:] = True
         else:
             a_chunk = torch.arange(win_chunks, device=device).repeat_interleave(actions_per_chunk)
@@ -430,38 +439,153 @@ class RollingWAM(WAM):
         self._push_count: int = 0
         self._cached_context: Optional[tuple] = None
         self._cached_negative: Optional[tuple] = None
+        self._video_generation_failed = False
 
-    def _push_noise_chunk(self, z: int, latent_h: int, latent_w: int, aspc: int, seed: Optional[int]):
+    def _disable_fastwam_video(self):
+        """Drop failed auxiliary video without resetting the rolling action state."""
+        self._video_generation_failed = True
+        self._window_latents = None
+        logger.warning(
+            "FastWAM imagined-video generation failed; continuing action-only until rolling_reset().",
+            exc_info=True,
+        )
+
+    def _push_noise_chunk(
+        self, z: int, latent_h: int, latent_w: int, aspc: int, seed: Optional[int],
+        generate_video: bool = True,
+    ):
         """Append a pure-noise chunk at the back of the window, rung 0.
         Deterministic per-push seed keeps CFG ranks and reruns identical."""
         gen = None
         if seed is not None:
             gen = torch.Generator(device="cpu").manual_seed(seed + self._push_count)
         self._push_count += 1
-        v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen).to(
-            device=self.device, dtype=self.torch_dtype
-        )
-        if self._window_latents is None or self._window_latents.shape[2] == 0:
-            self._window_latents = v
+        if self.fastwam_mode:
+            # Action noise must be identical with optional video recording on/off.
+            a = torch.randn((1, aspc, self.action_expert.action_dim), generator=gen).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+            if generate_video and not self._video_generation_failed:
+                try:
+                    # Video noise is sampled on CPU; restore global RNG for seed=None.
+                    with torch.random.fork_rng(devices=[]):
+                        v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen).to(
+                            device=self.device, dtype=self.torch_dtype
+                        )
+                    if self._window_latents is None or self._window_latents.shape[2] == 0:
+                        self._window_latents = v
+                    else:
+                        self._window_latents = torch.cat([self._window_latents, v], dim=2)
+                except Exception:
+                    self._disable_fastwam_video()
         else:
-            self._window_latents = torch.cat([self._window_latents, v], dim=2)
-        a = torch.randn((1, aspc, self.action_expert.action_dim), generator=gen).to(
-            device=self.device, dtype=self.torch_dtype
-        )
+            # Preserve the original RollingWAM random stream and sampling order.
+            v = torch.randn((1, z, self.chunk_latents, latent_h, latent_w), generator=gen).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+            a = torch.randn((1, aspc, self.action_expert.action_dim), generator=gen).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+            if self._window_latents is None or self._window_latents.shape[2] == 0:
+                self._window_latents = v
+            else:
+                self._window_latents = torch.cat([self._window_latents, v], dim=2)
         if self._window_action is None or self._window_action.shape[1] == 0:
             self._window_action = a
         else:
             self._window_action = torch.cat([self._window_action, a], dim=1)
         self._rungs.append(0)
 
-    def _pop_front_chunk(self, aspc: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _pop_front_chunk(self, aspc: int) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         nfpb = self.chunk_latents
-        front = self._window_latents[:, :, :nfpb]
-        self._window_latents = self._window_latents[:, :, nfpb:]
+        front = None
+        if self._window_latents is not None:
+            front = self._window_latents[:, :, :nfpb]
+            self._window_latents = self._window_latents[:, :, nfpb:]
         act = self._window_action[:, :aspc]
         self._window_action = self._window_action[:, aspc:]
         self._rungs = self._rungs[1:]
         return front, act
+
+    def _prepare_fastwam_cache(
+        self, anchor_latent: torch.Tensor, context: torch.Tensor,
+        context_mask: torch.Tensor, compile_action_infer: bool,
+    ) -> dict[str, Any]:
+        """Cache the observed image once per replan, including current text/state."""
+        (
+            video_tokens, _t, video_t_mod, video_context, video_context_mask,
+            video_freqs, _f, _h, _w, _tokens_per_frame,
+        ) = self.video_expert.prepare(
+            x=anchor_latent,
+            timestep=torch.zeros((anchor_latent.shape[0], 1), device=self.device, dtype=self.torch_dtype),
+            context=context, context_mask=context_mask, action=None,
+            fuse_vae_embedding_in_latents=bool(self.video_expert.fuse_vae_embedding_in_latents),
+        )
+        anchor_tokens = video_tokens.shape[1]
+        video_mask = torch.ones((anchor_tokens, anchor_tokens), device=self.device, dtype=torch.bool)
+        action_count = self.window_blocks * self.actions_per_chunk
+        # No future-video square mask is allocated in the action-only path.
+        action_mask = torch.ones(
+            (action_count, anchor_tokens + action_count), device=self.device, dtype=torch.bool,
+        )
+        if self.disable_future_attention:
+            chunks = torch.arange(self.window_blocks, device=self.device).repeat_interleave(self.actions_per_chunk)
+            action_mask[:, anchor_tokens:] = chunks[:, None] >= chunks[None, :]
+        if compile_action_infer:
+            if not hasattr(self, "_prefill_video_cache_compiled"):
+                self._prefill_video_cache_compiled = torch.compile(
+                    self.mot.prefill_video_cache_tensor, mode="reduce-overhead", fullgraph=True,
+                )
+            if not hasattr(self, "_denoise_action_with_video_cache_compiled"):
+                self._denoise_action_with_video_cache_compiled = torch.compile(
+                    self._denoise_action_with_video_cache, mode="reduce-overhead", fullgraph=True,
+                )
+            prefill = self._prefill_video_cache_compiled
+            torch.compiler.cudagraph_mark_step_begin()
+        else:
+            prefill = self.mot.prefill_video_cache_tensor
+        keys, values = prefill(
+            video_tokens=video_tokens, video_freqs=video_freqs, video_t_mod=video_t_mod,
+            video_context=video_context, video_context_mask=video_context_mask,
+            video_attention_mask=video_mask,
+        )
+        if compile_action_infer:
+            # Prefill's CUDA Graph storage must survive subsequent denoising calls.
+            keys, values = [key.clone() for key in keys], [value.clone() for value in values]
+        return dict(video_cache_k=keys, video_cache_v=values, action_attention_mask=action_mask)
+
+    def _fastwam_action_prediction(
+        self, context: torch.Tensor, context_mask: torch.Tensor, ladder_t: torch.Tensor,
+        aspc: int, action_cache: dict[str, Any], compile_action_infer: bool,
+    ) -> torch.Tensor:
+        rungs = torch.tensor(self._rungs, device=self.device)
+        timestep = ladder_t[rungs].to(torch.float32).repeat_interleave(aspc).unsqueeze(0)
+        denoise = self._denoise_action_with_video_cache
+        if compile_action_infer:
+            denoise = self._denoise_action_with_video_cache_compiled
+            torch.compiler.cudagraph_mark_step_begin()
+        return denoise(
+            latents_action=self._window_action, timestep_action=timestep,
+            context=context, context_mask=context_mask, **action_cache,
+        )
+
+    @torch.no_grad()
+    def _fastwam_window_pass(
+        self, context: torch.Tensor, context_mask: torch.Tensor,
+        ladder_t: torch.Tensor, ladder_delta: torch.Tensor, aspc: int,
+        action_cache: dict[str, Any], advance: Optional[list] = None,
+        compile_action_infer: bool = False,
+    ) -> None:
+        """Advance action chunks on the original rolling ladder without future video."""
+        pred_action = self._fastwam_action_prediction(
+            context, context_mask, ladder_t, aspc, action_cache, compile_action_infer,
+        )
+        adv = [True] * len(self._rungs) if advance is None else advance
+        for j, rung in enumerate(self._rungs):
+            if adv[j]:
+                block = slice(j * aspc, (j + 1) * aspc)
+                self._window_action[:, block] += pred_action[:, block] * ladder_delta[rung]
+        self._rungs = [rung + 1 if move else rung for rung, move in zip(self._rungs, adv)]
 
     @torch.no_grad()
     def _window_pass(
@@ -478,6 +602,7 @@ class RollingWAM(WAM):
         advance: Optional[list] = None,
         attention_mask: Optional[torch.Tensor] = None,
         compile_action_infer: bool = False,
+        action_cache: Optional[dict[str, Any]] = None,
     ):
         """One denoise pass over the window against the latest-observation anchor.
         `advance[j]=False` freezes chunk j (boundary init phase: clipped chunks stay pure noise)."""
@@ -488,58 +613,79 @@ class RollingWAM(WAM):
                 f"`anchor_latent` must contain one latent frame, got {anchor_latent.shape[2]}."
             )
 
-        latents = torch.cat([anchor_latent, self._window_latents], dim=2)
-        rungs = torch.tensor(self._rungs, device=self.device)
-        t_chunk = ladder_t[rungs].to(torch.float32)                              # [win]
-        timestep_video = torch.zeros((1, latents.shape[2]), dtype=torch.float32, device=self.device)
-        timestep_video[0, 1:] = t_chunk.repeat_interleave(nfpb)
-        t_window_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)           # [1, win*aspc]
-
-        if attention_mask is None:
-            patch_h, patch_w = self.video_expert.patch_size[1:]
-            attention_mask = self._build_rolling_attention_mask(
-                win_chunks=win,
-                tokens_per_frame=(latents.shape[3] // patch_h) * (latents.shape[4] // patch_w),
-                actions_per_chunk=aspc,
-                device=self.device,
-            )
-        joint_denoise_core = self._get_joint_denoise_core(compile_action_infer)
-
-        def predict(ctx, ctx_mask):
-            if compile_action_infer:
-                torch.compiler.cudagraph_mark_step_begin()
-            return joint_denoise_core(
-                latents_video=latents,
-                latents_action=self._window_action,
-                timestep_video=timestep_video,
-                timestep_action=t_window_action,
-                context=ctx,
-                context_mask=ctx_mask,
-                attention_mask=attention_mask,
-                fuse_vae_embedding_in_latents=bool(
-                    getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
-                ),
-            )
-
-        pred_video, pred_action = predict(context, context_mask)
-        if text_cfg_scale != 1.0 and negative_context is not None:
-            if compile_action_infer:
-                # The negative pass may replay into the same CUDA Graph output buffers.
-                pred_video, pred_action = pred_video.clone(), pred_action.clone()
-            pred_video_neg, _ = predict(negative_context, negative_context_mask)
-            pred_video = pred_video_neg + text_cfg_scale * (pred_video - pred_video_neg)
-            # action keeps the conditional prediction
-
         adv = [True] * win if advance is None else advance
-        pred_window = pred_video[:, :, 1:]
-        for j, r in enumerate(self._rungs):
-            if not adv[j]:
-                continue
-            delta = ladder_delta[r]
-            vs = slice(j * nfpb, (j + 1) * nfpb)
-            self._window_latents[:, :, vs] += pred_window[:, :, vs] * delta
-            as_ = slice(j * aspc, (j + 1) * aspc)
-            self._window_action[:, as_] += pred_action[:, as_] * delta
+
+        def advance_video():
+            nonlocal attention_mask
+            latents = torch.cat([anchor_latent, self._window_latents], dim=2)
+            rungs = torch.tensor(self._rungs, device=self.device)
+            t_chunk = ladder_t[rungs].to(torch.float32)                              # [win]
+            timestep_video = torch.zeros((1, latents.shape[2]), dtype=torch.float32, device=self.device)
+            timestep_video[0, 1:] = t_chunk.repeat_interleave(nfpb)
+            t_window_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)           # [1, win*aspc]
+
+            if attention_mask is None:
+                patch_h, patch_w = self.video_expert.patch_size[1:]
+                attention_mask = self._build_rolling_attention_mask(
+                    win_chunks=win,
+                    tokens_per_frame=(latents.shape[3] // patch_h) * (latents.shape[4] // patch_w),
+                    actions_per_chunk=aspc,
+                    device=self.device,
+                )
+            joint_denoise_core = self._get_joint_denoise_core(compile_action_infer)
+
+            def predict(ctx, ctx_mask):
+                if compile_action_infer:
+                    torch.compiler.cudagraph_mark_step_begin()
+                return joint_denoise_core(
+                    latents_video=latents,
+                    latents_action=self._window_action,
+                    timestep_video=timestep_video,
+                    timestep_action=t_window_action,
+                    context=ctx,
+                    context_mask=ctx_mask,
+                    attention_mask=attention_mask,
+                    fuse_vae_embedding_in_latents=bool(
+                        getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
+                    ),
+                )
+
+            pred_video, pred_action = predict(context, context_mask)
+            if text_cfg_scale != 1.0 and negative_context is not None:
+                if compile_action_infer:
+                    # The negative pass may replay into the same CUDA Graph output buffers.
+                    pred_video, pred_action = pred_video.clone(), pred_action.clone()
+                pred_video_neg, _ = predict(negative_context, negative_context_mask)
+                pred_video = pred_video_neg + text_cfg_scale * (pred_video - pred_video_neg)
+                # action keeps the conditional prediction
+
+            pred_window = pred_video[:, :, 1:]
+            for j, rung in enumerate(self._rungs):
+                if adv[j]:
+                    block = slice(j * nfpb, (j + 1) * nfpb)
+                    self._window_latents[:, :, block] += pred_window[:, :, block] * ladder_delta[rung]
+            return pred_action
+
+        try:
+            pred_action = advance_video()
+        except Exception:
+            if action_cache is None:
+                raise
+            # No action/rung has advanced yet. Discard auxiliary video, then
+            # perform exactly the same cached action step as normal FastWAM.
+            self._disable_fastwam_video()
+
+        if action_cache is not None:
+            self._fastwam_window_pass(
+                context, context_mask, ladder_t, ladder_delta, aspc, action_cache,
+                advance=advance, compile_action_infer=compile_action_infer,
+            )
+            return
+
+        for j, rung in enumerate(self._rungs):
+            if adv[j]:
+                block = slice(j * aspc, (j + 1) * aspc)
+                self._window_action[:, block] += pred_action[:, block] * ladder_delta[rung]
         self._rungs = [r + 1 if a else r for r, a in zip(self._rungs, adv)]
 
     @torch.no_grad()
@@ -555,9 +701,15 @@ class RollingWAM(WAM):
         seed: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
         compile_action_infer: bool = False,
+        return_video: bool = False,
     ) -> dict[str, Any]:
-        """One control step: condition on the latest observation and roll video and
-        actions jointly. Returns {'action': [aspc, action_dim], 'video': front chunk latents}."""
+        """Roll one action chunk from the latest observation.
+
+        FastWAM mode skips future video unless return_video=True for diagnostics.
+        The video output is None on that action-only path. Enable diagnostics at
+        stream start; disabling them mid-stream is supported. A diagnostic failure
+        disables video until rolling_reset() without resetting the action window.
+        """
         # Deployment normally sets eval mode once when the model is loaded. Avoid
         # recursively traversing the full module tree again on every replan.
         if self.training:
@@ -572,6 +724,12 @@ class RollingWAM(WAM):
                 f"`new_frames` must be one latest frame [1, 3, 1, H, W], got {tuple(new_frames.shape)}"
             )
 
+        generate_video = not self.fastwam_mode or (return_video and not self._video_generation_failed)
+        first_call = self._window_action is None
+        if generate_video and not first_call and self._window_latents is None:
+            raise ValueError("Call rolling_reset() before enabling video generation mid-stream.")
+        if not generate_video:
+            self._window_latents = None
         W = self.window_blocks
         if num_inference_steps is None:
             raise ValueError("`num_inference_steps` is required (inference-only knob, not model config)")
@@ -583,7 +741,6 @@ class RollingWAM(WAM):
         elif S != self._stream_steps:
             raise ValueError(f"num_inference_steps changed mid-stream: {self._stream_steps} -> {S}")
         sub = S // W
-        first_call = self._window_action is None
 
         if prompt is not None:
             if self._cached_context is None or self._cached_context[0] != prompt:
@@ -602,16 +759,22 @@ class RollingWAM(WAM):
                 proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
             )
         negative_context = negative_context_mask = None
-        if text_cfg_scale != 1.0:
-            if self._cached_negative is None:
-                self._cached_negative = self.encode_prompt(negative_prompt or "")
-            negative_context, negative_context_mask = self._cached_negative
-            if proprio is not None:
-                negative_context, negative_context_mask = self._append_proprio_to_context(
-                    context=negative_context,
-                    context_mask=negative_context_mask,
-                    proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
-                )
+        if generate_video and text_cfg_scale != 1.0:
+            try:
+                if self._cached_negative is None:
+                    self._cached_negative = self.encode_prompt(negative_prompt or "")
+                negative_context, negative_context_mask = self._cached_negative
+                if proprio is not None:
+                    negative_context, negative_context_mask = self._append_proprio_to_context(
+                        context=negative_context,
+                        context_mask=negative_context_mask,
+                        proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
+                    )
+            except Exception:
+                if not self.fastwam_mode:
+                    raise
+                self._disable_fastwam_video()
+                generate_video = False
 
         anchor_latent = self._encode_video_latents(
             new_frames.to(device=self.device, dtype=self.torch_dtype)
@@ -623,41 +786,57 @@ class RollingWAM(WAM):
         )
         aspc = self.actions_per_chunk
         ladder_t, ladder_delta = self._rolling_ladder(S, self.device, torch.float32)
-        patch_h, patch_w = self.video_expert.patch_size[1:]
-        attention_mask = self._build_rolling_attention_mask(
-            win_chunks=W,
-            tokens_per_frame=(latent_h // patch_h) * (latent_w // patch_w),
-            actions_per_chunk=aspc,
-            device=self.device,
-        )
+        action_cache = None
+        if self.fastwam_mode:
+            action_cache = self._prepare_fastwam_cache(
+                anchor_latent, context, context_mask, compile_action_infer,
+            )
+        attention_mask = None
+        if generate_video:
+            try:
+                patch_h, patch_w = self.video_expert.patch_size[1:]
+                attention_mask = self._build_rolling_attention_mask(
+                    win_chunks=W,
+                    tokens_per_frame=(latent_h // patch_h) * (latent_w // patch_w),
+                    actions_per_chunk=aspc,
+                    device=self.device,
+                )
+            except Exception:
+                if not self.fastwam_mode:
+                    raise
+                self._disable_fastwam_video()
+                generate_video = False
+
+        def window_pass(advance=None):
+            if generate_video and not self._video_generation_failed:
+                self._window_pass(
+                    anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
+                    text_cfg_scale, negative_context, negative_context_mask,
+                    advance=advance, attention_mask=attention_mask,
+                    compile_action_infer=compile_action_infer, action_cache=action_cache,
+                )
+            else:
+                self._fastwam_window_pass(
+                    context, context_mask, ladder_t, ladder_delta, aspc, action_cache,
+                    advance=advance, compile_action_infer=compile_action_infer,
+                )
 
         if first_call:
             # boundary init phase (t^init): full window of pure noise; chunk j stays
             # clipped at sigma=1 until pass j*sub, then advances one rung per pass
             for _ in range(W):
-                self._push_noise_chunk(z, latent_h, latent_w, aspc, seed)
+                self._push_noise_chunk(z, latent_h, latent_w, aspc, seed, generate_video=generate_video)
             for p in range(S):
-                self._window_pass(
-                    anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
-                    text_cfg_scale, negative_context, negative_context_mask,
-                    advance=[p >= j * sub for j in range(W)],
-                    attention_mask=attention_mask,
-                    compile_action_infer=compile_action_infer,
-                )
+                window_pass(advance=[p >= j * sub for j in range(W)])
         else:
-            self._push_noise_chunk(z, latent_h, latent_w, aspc, seed)
+            self._push_noise_chunk(z, latent_h, latent_w, aspc, seed, generate_video=generate_video)
             for _ in range(sub):
-                self._window_pass(
-                    anchor_latent, context, context_mask, ladder_t, ladder_delta, aspc,
-                    text_cfg_scale, negative_context, negative_context_mask,
-                    attention_mask=attention_mask,
-                    compile_action_infer=compile_action_infer,
-                )
+                window_pass()
 
         video_front, action_front = self._pop_front_chunk(aspc)
         return {
             "action": action_front[0].detach().to(device="cpu", dtype=torch.float32),
-            "video": video_front.detach(),
+            "video": None if video_front is None else video_front.detach(),
         }
 
     # ------------------------------------------------------------------ open-loop eval
@@ -683,8 +862,8 @@ class RollingWAM(WAM):
         compile_action_infer: bool = False,
         **_: Any,
     ) -> dict[str, Any]:
-        """Open-loop rollout for evaluation: rolling generation from one image, feeding the
-        model's own emitted chunks back as context (no ground-truth camera available)."""
+        """Open-loop video diagnostic. FastWAM actions retain the original observed
+        image as context; standard RollingWAM feeds its emitted video back in."""
         del action, sigma_shift, rand_device, tiled
         self.eval()
         if input_image.ndim == 3:
@@ -735,12 +914,20 @@ class RollingWAM(WAM):
                 seed=seed,
                 num_inference_steps=num_inference_steps,
                 compile_action_infer=compile_action_infer,
+                return_video=True,
             )
+            if out["video"] is None:
+                self.rolling_reset()
+                raise RuntimeError("Imagined-video generation failed during infer_joint; see the logged exception.")
             emitted_action.append(out["action"])
             emitted_video.append(out["video"])
 
             if chunk_index + 1 == num_chunks:
                 break
+
+            if self.fastwam_mode:
+                # Future video is auxiliary; never feed it back into FastWAM actions.
+                continue
 
             stream = torch.cat([anchor_latent] + emitted_video, dim=2)
             decoded = self._decode_latents_tensor(stream)
