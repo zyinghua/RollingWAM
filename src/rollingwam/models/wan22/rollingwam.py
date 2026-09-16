@@ -435,6 +435,7 @@ class RollingWAM(WAM):
         self._window_latents: Optional[torch.Tensor] = None   # [1, z, win*nfpb, h, w]
         self._window_action: Optional[torch.Tensor] = None    # [1, win*aspc, action_dim]
         self._rungs: list[int] = []
+        self._compiled_rungs: Optional[torch.Tensor] = None
         self._stream_steps: Optional[int] = None               # S locked for the episode
         self._push_count: int = 0
         self._cached_context: Optional[tuple] = None
@@ -495,6 +496,10 @@ class RollingWAM(WAM):
         else:
             self._window_action = torch.cat([self._window_action, a], dim=1)
         self._rungs.append(0)
+        if self._compiled_rungs is not None:
+            self._compiled_rungs = torch.cat(
+                [self._compiled_rungs, self._compiled_rungs.new_zeros(1)]
+            )
 
     def _pop_front_chunk(self, aspc: int) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         nfpb = self.chunk_latents
@@ -505,7 +510,97 @@ class RollingWAM(WAM):
         act = self._window_action[:, :aspc]
         self._window_action = self._window_action[:, aspc:]
         self._rungs = self._rungs[1:]
+        if self._compiled_rungs is not None:
+            self._compiled_rungs = self._compiled_rungs[1:]
         return front, act
+
+    def _rolling_joint_step_core(
+        self,
+        anchor_latent: torch.Tensor,
+        window_latents: torch.Tensor,
+        window_action: torch.Tensor,
+        rungs: torch.Tensor,
+        advance: torch.Tensor,
+        ladder_t: torch.Tensor,
+        ladder_delta: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        negative_context: Optional[torch.Tensor],
+        negative_context_mask: Optional[torch.Tensor],
+        text_cfg_scale: float,
+        fuse_vae_embedding_in_latents: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tensor-only joint rolling pass used by the compiled inference path."""
+        win = rungs.shape[0]
+        nfpb = self.chunk_latents
+        aspc = self.actions_per_chunk
+        latents = torch.cat([anchor_latent, window_latents], dim=2)
+        t_chunk = ladder_t.index_select(0, rungs).to(torch.float32)
+        timestep_video = torch.cat(
+            [
+                torch.zeros((latents.shape[0], 1), dtype=torch.float32, device=latents.device),
+                t_chunk.repeat_interleave(nfpb).unsqueeze(0),
+            ],
+            dim=1,
+        )
+        timestep_action = t_chunk.repeat_interleave(aspc).unsqueeze(0)
+
+        pred_video, pred_action = self._joint_denoise_core(
+            latents_video=latents,
+            latents_action=window_action,
+            timestep_video=timestep_video,
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            attention_mask=attention_mask,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        if text_cfg_scale != 1.0 and negative_context is not None:
+            pred_video_negative, _ = self._joint_denoise_core(
+                latents_video=latents,
+                latents_action=window_action,
+                timestep_video=timestep_video,
+                timestep_action=timestep_action,
+                context=negative_context,
+                context_mask=negative_context_mask,
+                attention_mask=attention_mask,
+                fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            )
+            pred_video = pred_video_negative + text_cfg_scale * (
+                pred_video - pred_video_negative
+            )
+
+        chunk_delta = ladder_delta.index_select(0, rungs)
+        video_delta = chunk_delta.to(window_latents.dtype).repeat_interleave(nfpb).view(
+            1, 1, win * nfpb, 1, 1
+        )
+        action_delta = chunk_delta.to(window_action.dtype).repeat_interleave(aspc).view(
+            1, win * aspc, 1
+        )
+        advance_video = advance.repeat_interleave(nfpb).view(1, 1, win * nfpb, 1, 1)
+        advance_action = advance.repeat_interleave(aspc).view(1, win * aspc, 1)
+        window_latents = torch.where(
+            advance_video,
+            window_latents + pred_video[:, :, 1:] * video_delta,
+            window_latents,
+        )
+        window_action = torch.where(
+            advance_action,
+            window_action + pred_action * action_delta,
+            window_action,
+        )
+        rungs = torch.where(advance, rungs + 1, rungs)
+        return window_latents, window_action, rungs
+
+    def _get_compiled_rolling_joint_step(self):
+        if not hasattr(self, "_rolling_joint_step_core_compiled_inference"):
+            self._rolling_joint_step_core_compiled_inference = torch.compile(
+                self._rolling_joint_step_core,
+                mode="reduce-overhead",
+                fullgraph=True,
+            )
+        return self._rolling_joint_step_core_compiled_inference
 
     def _prepare_fastwam_cache(
         self, anchor_latent: torch.Tensor, context: torch.Tensor,
@@ -615,6 +710,48 @@ class RollingWAM(WAM):
 
         adv = [True] * win if advance is None else advance
 
+        if compile_action_infer and action_cache is None:
+            if attention_mask is None:
+                patch_h, patch_w = self.video_expert.patch_size[1:]
+                attention_mask = self._build_rolling_attention_mask(
+                    win_chunks=win,
+                    tokens_per_frame=(anchor_latent.shape[3] // patch_h)
+                    * (anchor_latent.shape[4] // patch_w),
+                    actions_per_chunk=aspc,
+                    device=self.device,
+                )
+            if self._compiled_rungs is None or self._compiled_rungs.shape[0] != win:
+                self._compiled_rungs = torch.tensor(
+                    self._rungs, dtype=torch.long, device=self.device
+                )
+            advance_tensor = torch.tensor(adv, dtype=torch.bool, device=self.device)
+            torch.compiler.cudagraph_mark_step_begin()
+            window_latents, window_action, rungs = self._get_compiled_rolling_joint_step()(
+                anchor_latent=anchor_latent,
+                window_latents=self._window_latents,
+                window_action=self._window_action,
+                rungs=self._compiled_rungs,
+                advance=advance_tensor,
+                ladder_t=ladder_t,
+                ladder_delta=ladder_delta,
+                context=context,
+                context_mask=context_mask,
+                attention_mask=attention_mask,
+                negative_context=negative_context,
+                negative_context_mask=negative_context_mask,
+                text_cfg_scale=text_cfg_scale,
+                fuse_vae_embedding_in_latents=bool(
+                    getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
+                ),
+            )
+            # reduce-overhead mode may reuse CUDA Graph output storage on the next
+            # replay; retain independent streaming state across denoising passes.
+            self._window_latents = window_latents.clone()
+            self._window_action = window_action.clone()
+            self._compiled_rungs = rungs.clone()
+            self._rungs = [r + 1 if a else r for r, a in zip(self._rungs, adv)]
+            return
+
         def advance_video():
             nonlocal attention_mask
             latents = torch.cat([anchor_latent, self._window_latents], dim=2)
@@ -682,6 +819,7 @@ class RollingWAM(WAM):
             )
             return
 
+        self._compiled_rungs = None
         for j, rung in enumerate(self._rungs):
             if adv[j]:
                 block = slice(j * aspc, (j + 1) * aspc)
