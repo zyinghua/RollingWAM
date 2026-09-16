@@ -11,6 +11,10 @@
 #   BUILD_ONLY=1   build + push and exit (run this on the docker host)
 #   DRY_RUN=1      print the job summary without submitting
 #   QUEUE=<alias>  override the target YAML's queue
+#   PRIORITY=<n>   Batch schedulingPriority (default 400). Everyone on these
+#                  queues submits under shareIdentifier "default", so fair-share
+#                  collapses and this is the lever that decides who gets the next
+#                  freed node.
 #   SM_USER        job-name prefix (default: $USER)
 #
 # Pull in secrets (WANDB_API_KEY etc.) — launch_sm.py forwards WANDB_*/HF_TOKEN
@@ -39,6 +43,7 @@ EXTRA=()
 [ "${DRY_RUN:-0}" = 1 ]    && EXTRA+=(--dry-run)
 [ -n "${NAME}" ]           && EXTRA+=(--name "${NAME}")
 [ -n "${QUEUE:-}" ]        && EXTRA+=(--queue "${QUEUE}")
+[ -n "${PRIORITY:-}" ]     && EXTRA+=(--priority "${PRIORITY}")
 # Spot queues are rejected unless the job also asks for spot instances.
 case "${QUEUE:-}" in *spot*) EXTRA+=(--spot);; esac
 

@@ -149,6 +149,24 @@ def prune_once(state_s3: str, weights_s3: str, archive_s3: str, local_state: Pat
         if verbose:
             print(f"[prune] {msg}", flush=True)
 
+    # Local copies go FIRST, before any S3 call. Archiving one ~81 GB DeepSpeed
+    # state is an `aws s3 mv --recursive` that takes ~8 minutes, and SageMaker's
+    # checkpoint sync keeps uploading during that window: anything still on disk
+    # during that window can be put straight back into the prefix we just pruned.
+    #
+    # NOTE (measured on g1-puffs-rolling, 2026-09-12): ordering local-first is
+    # necessary but NOT sufficient. That run still re-archived step_001000 every
+    # ~21 minutes, and S3 kept showing the step back under the job prefix, so
+    # something is still reinstating it. The three logged numbers below exist to
+    # settle it on the next run: if `local before` does not contain the step, the
+    # re-upload is not coming from this host's disk and the sync itself is
+    # restoring it; if `local after` still contains it, the rmtree is failing
+    # silently (drop_local passes ignore_errors=True).
+    say(f"local before={local_steps(local_state)} "
+        f"s3={steps} keep={newest} archive={to_archive} delete={to_delete}")
+    drop_local([*to_archive, *to_delete], local_state, local_weights, say)
+    say(f"local after={local_steps(local_state)}")
+
     for step in to_archive:
         name = f"step_{step:06d}"
         say(f"archiving {name} -> {archive_s3}")
@@ -163,10 +181,6 @@ def prune_once(state_s3: str, weights_s3: str, archive_s3: str, local_state: Pat
         _run(["aws", "s3", "rm", f"{state_s3.rstrip('/')}/{name}/", "--recursive", "--only-show-errors"])
         _run(["aws", "s3", "rm", f"{weights_s3.rstrip('/')}/{name}.pt", "--only-show-errors"])
 
-    # Drop the local copies too, or the checkpoint sync re-uploads them. This
-    # only covers THIS host; the other hosts reconcile via reconcile_local().
-    drop_local([*to_archive, *to_delete], local_state, local_weights, say)
-
     if to_archive or to_delete:
         say(f"kept {newest}, archived {to_archive}, deleted {to_delete}")
 
@@ -178,8 +192,32 @@ def archive_uri(checkpoint_s3: str, rel: str) -> str:
     return f"{parent}/_archive/{job}/{rel}"
 
 
+def _alive(pid: int) -> bool:
+    """True while ``pid`` still exists (signal 0 only probes, never delivers)."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _sleep_while_alive(seconds: int, parent_pid: int | None) -> bool:
+    """Sleep up to ``seconds``, waking early if the training process exits.
+
+    Returns False when the parent is gone and the caller should stop.
+    """
+    slept = 0
+    step = 30
+    while slept < seconds:
+        if parent_pid is not None and not _alive(parent_pid):
+            return False
+        time.sleep(min(step, seconds - slept))
+        slept += step
+    return parent_pid is None or _alive(parent_pid)
+
+
 def loop(output_dir: str, checkpoint_s3: str, keep: int, interval: int,
-         manage_s3: bool = True) -> None:
+         manage_s3: bool = True, parent_pid: int | None = None) -> None:
     rel = ""
     try:
         rel = str(Path(output_dir).resolve().relative_to("/opt/ml/checkpoints"))
@@ -193,7 +231,9 @@ def loop(output_dir: str, checkpoint_s3: str, keep: int, interval: int,
     print(f"[prune] watching {state_s3} (keep={keep}, every {interval}s, "
           f"archive -> {archive_s3}) [{role}]", flush=True)
     while True:
-        time.sleep(interval)
+        if not _sleep_while_alive(interval, parent_pid):
+            print("[prune] training process is gone; pruner exiting", flush=True)
+            return
         try:
             if manage_s3:
                 prune_once(state_s3, weights_s3, archive_s3, local / "state",
@@ -213,9 +253,14 @@ def spawn(output_dir: str, checkpoint_s3: str, *, keep: int = 1,
     outlives it. Pass ``manage_s3=False`` on non-main hosts: they must still
     clear their own local copies (otherwise the checkpoint sync re-uploads what
     the main host pruned) but must not race it writing S3.
+
+    The daemon watches the pid it was forked from. exec keeps that pid, so it is
+    the training process: when it goes, there is nothing left to prune and the
+    daemon stops instead of holding the container open on a finished job.
     """
     if not checkpoint_s3:
         return
+    trainer_pid = os.getpid()           # exec below keeps this pid
     try:
         if os.fork() != 0:
             return                      # parent: carry on and exec training
@@ -227,7 +272,8 @@ def spawn(output_dir: str, checkpoint_s3: str, *, keep: int = 1,
     except OSError:
         pass
     try:
-        loop(output_dir, checkpoint_s3, keep, interval, manage_s3=manage_s3)
+        loop(output_dir, checkpoint_s3, keep, interval, manage_s3=manage_s3,
+             parent_pid=trainer_pid)
     except Exception as exc:
         print(f"[prune] daemon exiting: {exc}", flush=True)
     finally:
