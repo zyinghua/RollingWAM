@@ -25,6 +25,7 @@ class RollingWAM(WAM):
         init_schedule_prob: float = 0.0,
         random_schedule_prob: float = 0.0,
         constant_schedule_prob: float = 0.0,
+        disable_future_attention: bool = False,
     ):
         for a, b in (
             (self.train_video_scheduler, self.train_action_scheduler),
@@ -49,6 +50,11 @@ class RollingWAM(WAM):
                 "`cross_chunk_a2a_attn` must be bool, "
                 f"got {type(cross_chunk_a2a_attn).__name__}."
             )
+        if not isinstance(disable_future_attention, bool):
+            raise ValueError(
+                "`disable_future_attention` must be bool, "
+                f"got {type(disable_future_attention).__name__}."
+            )
         if not 0.0 <= init_schedule_prob <= 1.0:
             raise ValueError(f"`init_schedule_prob` must be in [0, 1], got {init_schedule_prob}")
         if not 0.0 <= random_schedule_prob <= 1.0:
@@ -60,6 +66,7 @@ class RollingWAM(WAM):
         self.chunk_latents = int(chunk_latents)
         self.actions_per_chunk = int(actions_per_chunk)
         self.cross_chunk_a2a_attn = cross_chunk_a2a_attn
+        self.disable_future_attention = disable_future_attention
         self.init_schedule_prob = float(init_schedule_prob)
         self.random_schedule_prob = float(random_schedule_prob)
         self.constant_schedule_prob = float(constant_schedule_prob)
@@ -84,13 +91,15 @@ class RollingWAM(WAM):
     ROLLING_KEYS = (
         "window_blocks", "chunk_latents", "actions_per_chunk",
         "cross_chunk_a2a_attn", "init_schedule_prob", "random_schedule_prob",
-        "constant_schedule_prob",
+        "constant_schedule_prob", "disable_future_attention",
     )
     ROLLING_LEGACY_DEFAULTS = {
         # Every checkpoint written before this option existed used same-chunk A2A.
         "cross_chunk_a2a_attn": False,
         # Checkpoints written before the constant-level mixture trained without it.
         "constant_schedule_prob": 0.0,
+        # Older checkpoints allowed attention to future chunks in the window.
+        "disable_future_attention": False,
     }
 
     def get_rolling_config(self) -> dict[str, Any]:
@@ -204,6 +213,19 @@ class RollingWAM(WAM):
             mask[video_seq_len:, video_seq_len:] = (
                 a_chunk.view(-1, 1) == a_chunk.view(1, -1)
             )
+        if self.disable_future_attention:
+            # Restrict every existing edge by chunk order, including V->V so
+            # earlier video features cannot relay future information to actions.
+            # The observation anchor precedes chunk 0; tokens within a chunk
+            # remain bidirectional, including when a chunk has multiple latents.
+            chunks = torch.arange(win_chunks, device=device)
+            video_chunk = torch.cat([
+                torch.full((tokens_per_frame,), -1, device=device, dtype=torch.long),
+                chunks.repeat_interleave(self.chunk_latents * tokens_per_frame),
+            ])
+            action_chunk = chunks.repeat_interleave(actions_per_chunk)
+            token_chunk = torch.cat([video_chunk, action_chunk])
+            mask &= token_chunk[:, None] >= token_chunk[None, :]
         return mask
 
     # ------------------------------------------------------------------ training

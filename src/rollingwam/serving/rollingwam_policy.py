@@ -130,6 +130,10 @@ def _load_inference_checkpoint(model: Any, checkpoint_path: Path) -> int | None:
         raise ValueError("The configured model has no proprio encoder.")
 
     rolling = payload["rolling"]
+    if isinstance(rolling, dict):
+        # Preserve the original attention behavior for checkpoints predating
+        # optional rolling settings, while still requiring all structural keys.
+        rolling = {**model.ROLLING_LEGACY_DEFAULTS, **rolling}
     expected_rolling_keys = set(model.ROLLING_KEYS)
     if not isinstance(rolling, dict) or set(rolling) != expected_rolling_keys:
         got = sorted(rolling) if isinstance(rolling, dict) else type(rolling).__name__
