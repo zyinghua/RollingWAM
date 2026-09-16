@@ -51,7 +51,6 @@ class RunSpec:
     actions_per_chunk: int
     num_inference_steps: int
     steady_denoising_steps: int
-    compile_action_infer: bool
     model_seed: int
     synthetic_seed: int
 
@@ -66,7 +65,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--num-inference-steps", type=int, default=10)
-    parser.add_argument("--compile-action-infer", action="store_true")
     parser.add_argument("--expected-window-blocks", type=int, default=5)
     parser.add_argument("--expected-chunk-latents", type=int, default=1)
     parser.add_argument("--synthetic-seed", type=int, default=0)
@@ -186,7 +184,6 @@ def make_run_spec(model: torch.nn.Module, cfg: Any, args: argparse.Namespace) ->
         actions_per_chunk=actions_per_chunk,
         num_inference_steps=int(args.num_inference_steps),
         steady_denoising_steps=int(args.num_inference_steps) // window_blocks,
-        compile_action_infer=bool(args.compile_action_infer),
         model_seed=int(cfg.seed),
         synthetic_seed=int(args.synthetic_seed),
     )
@@ -229,7 +226,7 @@ def rolling_kwargs(spec: RunSpec, inputs: dict[str, torch.Tensor]) -> dict[str, 
         "text_cfg_scale": 1.0,
         "seed": spec.model_seed,
         "num_inference_steps": spec.num_inference_steps,
-        "compile_action_infer": spec.compile_action_infer,
+        "compile_action_infer": False,
     }
 
 
