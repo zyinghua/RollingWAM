@@ -191,6 +191,14 @@ class WorldActionRobotWinPolicy:
         self.text_cfg_scale = float(text_cfg_scale)
         self.negative_prompt = str(negative_prompt)
         self.timing_enabled = bool(timing_enabled)
+        self.hold_actions_for_timing = self.timing_enabled and _parse_bool(
+            os.environ.get("WAM_TIMING_HOLD_ACTIONS", "false")
+        )
+        capture_path = os.environ.get("WAM_TIMING_OBSERVATION_CAPTURE")
+        self.observation_capture_path = (
+            Path(capture_path).expanduser().resolve() if capture_path else None
+        )
+        self._captured_observations: list[Dict[str, Any]] = []
         self.compile_action_infer = bool(compile_action_infer)
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
         self.timing_task_name = timing_task_name
@@ -252,6 +260,14 @@ class WorldActionRobotWinPolicy:
             if self.timing_result_path is not None:
                 self.timing_result_path.parent.mkdir(parents=True, exist_ok=True)
                 logger.info("Replan timing JSON | %s", self.timing_result_path)
+        if self.observation_capture_path is not None:
+            if not self.timing_enabled:
+                raise ValueError("WAM_TIMING_OBSERVATION_CAPTURE requires timing_enabled=true")
+            self.observation_capture_path.parent.mkdir(parents=True, exist_ok=True)
+            atexit.register(self._write_observation_capture)
+            logger.info("RoboTwin observation capture | %s", self.observation_capture_path)
+        if self.hold_actions_for_timing:
+            logger.info("Timing control override | execute current qpos for every action")
 
         if save_imagined_rollouts and imagined_dir is None:
             raise ValueError(
@@ -405,7 +421,23 @@ class WorldActionRobotWinPolicy:
         self._imagined_latents = []
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
+        if self.observation_capture_path is not None:
+            obs_data = observation["observation"]
+            self._captured_observations.append(
+                {
+                    "head_rgb": np.asarray(obs_data["head_camera"]["rgb"], dtype=np.uint8).copy(),
+                    "left_rgb": np.asarray(obs_data["left_camera"]["rgb"], dtype=np.uint8).copy(),
+                    "right_rgb": np.asarray(obs_data["right_camera"]["rgb"], dtype=np.uint8).copy(),
+                    "state": np.asarray(observation["joint_action"]["vector"], dtype=np.float32).copy(),
+                    "instruction": str(instruction),
+                }
+            )
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        if self.hold_actions_for_timing:
+            current_qpos = np.asarray(
+                observation["joint_action"]["vector"], dtype=np.float32
+            )
+            action_chunk = np.repeat(current_qpos[None, :], action_chunk.shape[0], axis=0)
         # rolling executes one full chunk per replan; replan_steps (W=1 only) truncates it
         if self.replan_steps is not None:
             action_chunk = action_chunk[: self.replan_steps]
@@ -495,6 +527,7 @@ class WorldActionRobotWinPolicy:
             "unit": "ms",
             "task_name": self.timing_task_name,
             "checkpoint": self.checkpoint_path,
+            "hold_current_qpos": self.hold_actions_for_timing,
             "model": {
                 "window_blocks": window_blocks,
                 "chunk_latents": int(self.model.chunk_latents),
@@ -524,6 +557,19 @@ class WorldActionRobotWinPolicy:
             encoding="utf-8",
         )
         temporary_path.replace(self.timing_result_path)
+
+    def _write_observation_capture(self) -> None:
+        if self.observation_capture_path is None or not self._captured_observations:
+            return
+        rows = self._captured_observations
+        np.savez_compressed(
+            self.observation_capture_path,
+            head_rgb=np.stack([row["head_rgb"] for row in rows]),
+            left_rgb=np.stack([row["left_rgb"] for row in rows]),
+            right_rgb=np.stack([row["right_rgb"] for row in rows]),
+            state=np.stack([row["state"] for row in rows]),
+            instruction=np.asarray([row["instruction"] for row in rows]),
+        )
 
     def reset(self) -> None:
         self.pending_actions.clear()
